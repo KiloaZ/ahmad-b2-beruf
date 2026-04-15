@@ -1,0 +1,464 @@
+[
+  {
+    "id": "q1",
+    "topic": "Stressbewältigung",
+    "question": "Im Unternehmen findet ein Seminar zur Stressbewältigung statt. Ich würde es gerne besuchen. Bist du auch dabei?",
+    "redemittel": [
+      "Sehr gute Idee",
+      "Möglichkeit etwas Neues zu lernen",
+      "Momentan viel Stress"
+    ],
+    "suggestedAnswer": "Das ist eine sehr gute Idee und eine ausgezeichnete Möglichkeit, etwas Neues zu lernen. Ich werde auf jeden Fall dabei sein und freue mich darauf."
+  },
+  {
+    "id": "q2",
+    "topic": "Gesundheitsförderung",
+    "question": "In der Firma soll es Maßnahmen zur betrieblichen Gesundheitsförderung geben. Wie findest du das?",
+    "redemittel": [
+      "Firma denkt an Mitarbeiter",
+      "Wichtig an Gesundheit denken",
+      "Besser arbeiten"
+    ],
+    "suggestedAnswer": "Ich finde es sehr gut, dass die Firma an ihre Mitarbeiter denkt. Es ist äußerst wichtig, immer an die Gesundheit zu denken, um langfristig besser arbeiten zu können."
+  },
+  {
+    "id": "q3",
+    "topic": "Krankmeldung",
+    "question": "Weißt du, wie das in der Firma eigentlich mit der Krankmeldung geregelt ist?",
+    "redemittel": [
+      "Am ersten Tag anrufen",
+      "Ab dem dritten Tag Krankmeldung",
+      "Per E-Mail oder Post"
+    ],
+    "suggestedAnswer": "Du solltest am ersten Tag anrufen. Ab dem dritten Tag musst du die Krankmeldung offiziell per E-Mail oder per Post einreichen."
+  },
+  {
+    "id": "q4",
+    "topic": "E-Bike Zuschuss",
+    "question": "Hast du von dem Zuschuss der Firma für den Kauf eines E-Bikes gehört? Was denkst du darüber?",
+    "redemittel": [
+      "Sehr gute Idee",
+      "In der Nähe wohnen",
+      "Mit dem E-Bike kommen"
+    ],
+    "suggestedAnswer": "Ich finde das ist eine sehr gute Idee. Da ich in der Nähe wohne, werde ich in Zukunft mit dem E-Bike zur Arbeit kommen."
+  },
+  {
+    "id": "q5",
+    "topic": "Computerkurs",
+    "question": "Der Chef möchte, dass ich einen Computerkurs mache. Weißt du, wie ich das organisieren kann?",
+    "redemittel": [
+      "Computerkenntnisse wichtig",
+      "Online suchen",
+      "Flexibel sein"
+    ],
+    "suggestedAnswer": "Gute Computerkenntnisse sind heutzutage sehr wichtig. Du solltest online suchen, dort gibt es viele Kurse, die zeitlich sehr flexibel sind."
+  },
+  {
+    "id": "q6",
+    "topic": "Boni (Boni / Sonderzahlungen)",
+    "question": "Das Unternehmen gewährt keine Boni für dieses Jahr? Was hältst du davon?",
+    "redemittel": [
+      "Motivation der Mitarbeiter",
+      "Mehr Urlaubstage",
+      "Aktivitäten motivieren"
+    ],
+    "suggestedAnswer": "Boni spielen eine wichtige Rolle für die Motivation der Mitarbeiter. Falls es keine gibt, sollten stattdessen mehr Urlaubstage angeboten werden."
+  },
+  {
+    "id": "q7",
+    "topic": "Privathandy",
+    "question": "Denkst du, dass ich mein Privathandy benutzen soll, wenn ich kein Diensthandy habe?",
+    "redemittel": [
+      "Keine praktische Idee",
+      "Privatsphäre gestört",
+      "Jederzeit erreichbar"
+    ],
+    "suggestedAnswer": "Das ist keine praktische Idee, weil dadurch die Privatsphäre gestört werden könnte und man das Gefühl hat, jederzeit erreichbar sein zu müssen."
+  },
+  {
+    "id": "q8",
+    "topic": "AUB ab dem ersten Tag",
+    "question": "Der Chef möchte die Krankmeldung (AUB) ab dem ersten Tag. Was hältst du davon?",
+    "redemittel": [
+      "Sehr problematisch",
+      "Schwierig am ersten Tag",
+      "Unternehmen vertraut uns nicht"
+    ],
+    "suggestedAnswer": "Ich finde das sehr problematisch. Es ist oft schwierig, die AUB direkt am ersten Tag zu besorgen, und es vermittelt das Gefühl, dass das Unternehmen uns nicht vertraut."
+  },
+  {
+    "id": "q9",
+    "topic": "Tag der offenen Tür",
+    "question": "Am Samstag ist der Tag der offenen Tür. Wir können unsere Kinder mitbringen. Bist du dabei?",
+    "redemittel": [
+      "Tolle Idee",
+      "Arbeitsplatz sehen",
+      "Kollegen kennenlernen"
+    ],
+    "suggestedAnswer": "Das ist eine tolle Idee! Meine Kinder wollten schon immer meinen Arbeitsplatz sehen. So können sich auch die Kollegen untereinander besser kennenlernen."
+  },
+  {
+    "id": "q10",
+    "topic": "Urlaubssperre",
+    "question": "Im Dezember gibt es Urlaubssperre. Findest du das fair?",
+    "redemittel": [
+      "Unfair und schlecht",
+      "Urlaub mit der Familie",
+      "Früher Bescheid geben"
+    ],
+    "suggestedAnswer": "Ich finde das unfair, da viele Kollegen schon seit Monaten darauf warten, im Dezember Urlaub mit ihrer Familie zu verbringen."
+  },
+  {
+    "id": "q11",
+    "topic": "Nachtschicht",
+    "question": "Ich habe nächste Woche meine erste Nachtschicht. Was machst du, um wach zu bleiben?",
+    "redemittel": [
+      "Genug schlafen",
+      "Kaffee trinken",
+      "Regelmäßige Pausen"
+    ],
+    "suggestedAnswer": "Du solltest vorher genug schlafen. Außerdem hilft es, Kaffee zu trinken und regelmäßige Pausen an der frischen Luft zu machen."
+  },
+  {
+    "id": "q12",
+    "topic": "Kind in der Kita",
+    "question": "Mein Kind weint in der Kita. Hast du Erfahrungen damit und Tipps?",
+    "redemittel": [
+      "Geduldig bleiben",
+      "Mit dem Kind sprechen",
+      "Neue Freunde"
+    ],
+    "suggestedAnswer": "Man sollte geduldig bleiben und dem Kind erklären, dass es in der Kita schön sein wird und es dort viele neue Freunde kennenlernen wird."
+  },
+  {
+    "id": "q13",
+    "topic": "Ruhe nach der Arbeit",
+    "question": "Brauchst du nach der Arbeit auch erstmal Ruhe, wie ich?",
+    "redemittel": [
+      "Stunde Ruhe brauchen",
+      "Entspannen",
+      "Buch lesen / Tee trinken"
+    ],
+    "suggestedAnswer": "Ja, ich brauche meistens eine Stunde Ruhe, um mich zu entspannen. Dabei lese ich gerne ein Buch und trinke eine Tasse Tee."
+  },
+  {
+    "id": "q14",
+    "topic": "Weiterentwicklung",
+    "question": "Ich würde mich gerne weiterentwickeln. Hast du Ideen, was ich machen könnte?",
+    "redemittel": [
+      "Computerkurs",
+      "Englisch verbessern",
+      "Programmieren lernen"
+    ],
+    "suggestedAnswer": "Du könntest einen Computerkurs belegen oder dein Englisch verbessern. Momentan ist es auch sehr vorteilhaft, Programmieren zu lernen."
+  },
+  {
+    "id": "q15",
+    "topic": "Nebenjob",
+    "question": "Denkst du es ist eine gute Idee, einen Nebenjob anzunehmen?",
+    "redemittel": [
+      "Zusätzliches Einkommen",
+      "Minijob finden",
+      "Chef Bescheid geben"
+    ],
+    "suggestedAnswer": "Das ist eine gute Möglichkeit, wenn man ein zusätzliches Einkommen benötigt. Du solltest nach einem Minijob suchen, aber unbedingt vorher deinem Chef Bescheid geben."
+  },
+  {
+    "id": "q16",
+    "topic": "Veganes Essen",
+    "question": "Findest du auch super, dass in unserer Kantine mehr vegane Gerichte angeboten werden?",
+    "redemittel": [
+      "Tolle Idee",
+      "Auswahl haben",
+      "Gesund und schmeckt"
+    ],
+    "suggestedAnswer": "Ja, das ist eine tolle Idee. So haben alle Kollegen eine größere Auswahl. Veganes Essen ist gesund und schmeckt oft sehr gut."
+  },
+  {
+    "id": "q17",
+    "topic": "Gemeinsam etwas unternehmen",
+    "question": "Wollen wir im Sommer mal etwas zusammen unternehmen?",
+    "redemittel": [
+      "Tolle Idee",
+      "Heidelberg fahren",
+      "Sehenswürdigkeiten besichtigen"
+    ],
+    "suggestedAnswer": "Ja, tolle Idee! Wir könnten zusammen nach Heidelberg fahren und dort die verschiedenen Sehenswürdigkeiten besichtigen."
+  },
+  {
+    "id": "q18",
+    "topic": "Überstunden",
+    "question": "Ich mache gerne Überstunden. Und du?",
+    "redemittel": [
+      "Mehr Geld verdienen",
+      "Urlaub im Sommer",
+      "Guter Stundenlohn"
+    ],
+    "suggestedAnswer": "Ja, ich auch. Man verdient so mehr Geld für den Sommerurlaub, und an Feiertagen bekommt man oft einen sehr guten Stundenlohn."
+  },
+  {
+    "id": "q19",
+    "topic": "Betriebsfeier mit Partner",
+    "question": "Findest du eine Betriebsfeier mit oder ohne Partner besser?",
+    "redemittel": [
+      "Partner kennenlernen",
+      "Schöner Abend gemeinsam",
+      "Spaß machen"
+    ],
+    "suggestedAnswer": "Meiner Meinung nach ist es mit Partner besser, damit er die Kollegen mal kennenlernt und wir gemeinsam einen schönen Abend verbringen können."
+  },
+  {
+    "id": "q20",
+    "topic": "Mittagessen bestellen",
+    "question": "Sollen wir mittags etwas bestellen?",
+    "redemittel": [
+      "Sehr gute Idee",
+      "Gesunde Mahlzeit",
+      "Restaurant auswählen"
+    ],
+    "suggestedAnswer": "Das ist eine sehr gute Idee! Wie wäre es mit einer gesunden Mahlzeit? Ich kenne da ein wirklich gutes Restaurant."
+  },
+  {
+    "id": "q21",
+    "topic": "Unfreundliche Kollegin",
+    "question": "Meine neue Kollegin ist unfreundlich. Hast du Ratschläge?",
+    "redemittel": [
+      "Besser kennenlernen",
+      "Vielleicht schüchtern",
+      "Mit Abteilungsleiter sprechen"
+    ],
+    "suggestedAnswer": "Ich schlage vor, dass du das Gespräch suchst und versuchst, sie besser kennenzulernen. Vielleicht ist sie anfangs nur etwas schüchtern."
+  },
+  {
+    "id": "q22",
+    "topic": "Einladung zum Grillen",
+    "question": "Ich würde am Wochenende im Garten grillen, magst du kommen?",
+    "redemittel": [
+      "Vielen Dank für die Einladung",
+      "Wann und wo",
+      "Was mitbringen"
+    ],
+    "suggestedAnswer": "Vielen Dank für die Einladung! Ich komme sehr gerne. Wann und wo genau findet es statt? Soll ich noch etwas mitbringen?"
+  },
+  {
+    "id": "q23",
+    "topic": "Musikinstrument",
+    "question": "Spielst du ein Musikinstrument? Ich würde gerne eins lernen.",
+    "redemittel": [
+      "Onlinekurse",
+      "Präsenzkurs macht Spaß",
+      "Neue Leute kennenlernen"
+    ],
+    "suggestedAnswer": "Es gibt zwar viele Onlinekurse, aber ein Präsenzkurs macht oft mehr Spaß und bietet die Chance, neue Leute kennenzulernen."
+  },
+  {
+    "id": "q24",
+    "topic": "Schichtarbeit",
+    "question": "Für mich wäre Schichtarbeit kein Problem. Wie siehst du das?",
+    "redemittel": [
+      "Schwierig mit Kindern",
+      "Routine stören",
+      "Feste Arbeitszeiten"
+    ],
+    "suggestedAnswer": "Meiner Meinung nach ist das für mich schwierig, da ich Kinder habe und unregelmäßige Schichten ihren gewohnten Rhythmus stören würden."
+  },
+  {
+    "id": "q25",
+    "topic": "Brückentage",
+    "question": "Ich nehme an Brückentagen immer frei, und du?",
+    "redemittel": [
+      "Lange Ferien haben",
+      "Urlaub mit Familie",
+      "Von zuhause arbeiten"
+    ],
+    "suggestedAnswer": "Ja, manchmal mache ich das auch, um ein langes Wochenende zu haben. Aber bei hoher Arbeitslast arbeite ich lieber flexibel von zuhause aus."
+  },
+  {
+    "id": "q26",
+    "topic": "Aktive Pause",
+    "question": "Was könnte eine gute Idee für eine aktive Pause sein?",
+    "redemittel": [
+      "Sprache lernen",
+      "Buch lesen",
+      "Spazieren gehen"
+    ],
+    "suggestedAnswer": "Man könnte eine neue Sprache lernen, ein Buch lesen oder einfach spazieren gehen, um die Konzentration für den Rest des Tages zu steigern."
+  },
+  {
+    "id": "q27",
+    "topic": "Freizeitaktivitäten",
+    "question": "Ich singe jetzt in einem Chor. Was machst du gern in deiner Freizeit?",
+    "redemittel": [
+      "Bücher lesen",
+      "Sport machen",
+      "Wenig Freizeit"
+    ],
+    "suggestedAnswer": "Meistens lese ich Bücher oder treibe Sport. Leider habe ich momentan wenig Freizeit, da meine Kinder mich sehr fordern."
+  },
+  {
+    "id": "q28",
+    "topic": "Duzen oder Siezen",
+    "question": "Kannst du dir vorstellen, deinen Chef oder deine Chefin zu duzen?",
+    "redemittel": [
+      "Grenzen halten",
+      "Respekt zeigen",
+      "Besser siezen"
+    ],
+    "suggestedAnswer": "Ich finde es wichtig, berufliche Grenzen zu wahren und Respekt zu zeigen. Daher halte ich es für besser, Vorgesetzte im Arbeitsumfeld zu siezen."
+  },
+  {
+    "id": "q29",
+    "topic": "Frühschicht",
+    "question": "Bist du produktiver in der Frühschicht? Das trifft auf mich zu.",
+    "redemittel": [
+      "Produktiver sein",
+      "Zeit für Aufgaben",
+      "Gut für Leute mit Kindern"
+    ],
+    "suggestedAnswer": "Ja, ich bin morgens auch produktiver. Zudem hat man danach mehr Zeit für Termine, zum Kochen oder für die Hausaufgaben mit den Kindern."
+  },
+  {
+    "id": "q30",
+    "topic": "Teamarbeit",
+    "question": "Arbeitest du lieber im Team oder allein?",
+    "redemittel": [
+      "Team macht Spaß",
+      "Gegenseitig helfen",
+      "Aufgaben erledigen"
+    ],
+    "suggestedAnswer": "Ich arbeite lieber im Team, weil es einfach mehr Spaß macht und man sich bei komplexen Aufgaben gegenseitig unterstützen kann."
+  },
+  {
+    "id": "q31",
+    "topic": "Kosten für Fortbildungen",
+    "question": "Findest du es fair, dass wir die Kosten für Fortbildungen selbst tragen?",
+    "redemittel": [
+      "Fair wegen Weiterentwicklung",
+      "Schwierig bei wenig Gehalt",
+      "Firma Teil übernehmen"
+    ],
+    "suggestedAnswer": "Es ist zwar fair, da wir uns persönlich weiterentwickeln, aber bei einem geringen Gehalt ist es schwierig. Am besten wäre es, wenn die Firma einen Teil der Kosten übernimmt."
+  },
+  {
+    "id": "q32",
+    "topic": "Einspringen am Samstag",
+    "question": "Ich soll am Samstag einspringen. Bekomme ich dafür nächste Woche frei?",
+    "redemittel": [
+      "Tag frei bekommen",
+      "Nicht sicher sein",
+      "Abteilungsleiter fragen"
+    ],
+    "suggestedAnswer": "Ich denke, du solltest dafür einen Ausgleichstag bekommen. Am besten fragst du den Abteilungsleiter, um sicherzugehen."
+  },
+  {
+    "id": "q33",
+    "topic": "Feierabend am Freitag",
+    "question": "In einer Firma ist freitags schon um 14 Uhr Feierabend. Was hältst du davon?",
+    "redemittel": [
+      "Viel Zeit für Familie",
+      "Zeit genießen",
+      "Früher nach Hause"
+    ],
+    "suggestedAnswer": "Das ist natürlich hervorragend, weil man dadurch viel mehr Zeit für die Familie hat und das Wochenende früher einläuten kann."
+  },
+  {
+    "id": "q34",
+    "topic": "Resturlaub",
+    "question": "Ich habe noch fünf Tage Resturlaub. Was passiert mit diesen Tagen?",
+    "redemittel": [
+      "Zeit zum Entspannen",
+      "Neues Land besuchen",
+      "Ins nächste Jahr übertragen"
+    ],
+    "suggestedAnswer": "Nutze die Zeit zum Entspannen oder sprich mit deinem Vorgesetzten darüber, die Tage in das nächste Kalenderjahr zu übertragen."
+  },
+  {
+    "id": "q35",
+    "topic": "Selbstständigkeit",
+    "question": "Denkst du, es ist eine gute Idee, sich selbstständig zu machen?",
+    "redemittel": [
+      "Finanziell unabhängig",
+      "Bei niemandem arbeiten",
+      "Große Verantwortung"
+    ],
+    "suggestedAnswer": "Es ist eine gute Möglichkeit, um finanziell unabhängig zu sein und eigenverantwortlich zu arbeiten, allerdings ist die Verantwortung auch sehr groß."
+  },
+  {
+    "id": "q36",
+    "topic": "Mit dem Fahrrad zur Arbeit",
+    "question": "80% der Mitarbeiter kommen mit dem Fahrrad. Findest du das toll?",
+    "redemittel": [
+      "Gesund",
+      "Umweltfreundlich",
+      "Weit weg wohnen"
+    ],
+    "suggestedAnswer": "Ja, das ist großartig, da es sowohl gesund als auch umweltfreundlich ist. Leider wohne ich persönlich etwas zu weit weg dafür."
+  },
+  {
+    "id": "q37",
+    "topic": "Bargeldlose Zahlung",
+    "question": "Bevorzugst du bargeldlose Zahlungen oder zahlst du lieber bar?",
+    "redemittel": [
+      "Bargeldlose Zahlung",
+      "Geldbeutel verlieren",
+      "Schnell mit dem Handy"
+    ],
+    "suggestedAnswer": "Ich bevorzuge die bargeldlose Zahlung, da ich oft Angst habe, meinen Geldbeutel zu verlieren, und das Bezahlen mit dem Handy viel schneller geht."
+  },
+  {
+    "id": "q38",
+    "topic": "Feiertage verbringen",
+    "question": "Verbringst du wichtige Feiertage eher mit der Familie oder mit Freunden?",
+    "redemittel": [
+      "Mit der Familie",
+      "Nicht immer sehen können",
+      "Alle haben frei"
+    ],
+    "suggestedAnswer": "Ich verbringe die Feiertage meistens mit meiner Familie, da dann alle frei haben und es eine gute Gelegenheit ist, sich wiederzusehen."
+  },
+  {
+    "id": "q39",
+    "topic": "Urlaub buchen",
+    "question": "Wie und wann buchst du deinen Urlaub?",
+    "redemittel": [
+      "Monate im Voraus",
+      "Günstigere Tickets",
+      "Apps wie Booking.com"
+    ],
+    "suggestedAnswer": "Ich buche meistens zwei oder drei Monate im Voraus, da die Tickets dann günstiger sind. Oft nutze ich dafür Apps wie Booking.com."
+  },
+  {
+    "id": "q40",
+    "topic": "Teammeeting",
+    "question": "Teammeeting findet wöchentlich statt. Meinst du nicht, es ist zu oft?",
+    "redemittel": [
+      "Zu viel",
+      "Andere Aufgaben",
+      "Alle 2 Wochen"
+    ],
+    "suggestedAnswer": "Ich finde auch, dass das etwas zu viel ist. Meiner Meinung nach würde ein Treffen alle zwei Wochen völlig ausreichen."
+  },
+  {
+    "id": "q41",
+    "topic": "Uniform langweilig",
+    "question": "Ich finde die Uniform langweilig. Was ist deine Meinung?",
+    "redemittel": [
+      "Uniform abschaffen",
+      "Farbe ändern",
+      "Bequem / Zeit ersparen"
+    ],
+    "suggestedAnswer": "Da stimme ich dir zu. Andererseits ist sie sehr bequem und erspart uns die tägliche Entscheidung, was wir anziehen sollen."
+  },
+  {
+    "id": "q42",
+    "topic": "Gemeinsam etwas unternehmen",
+    "question": "Wollen wir im Sommer mal etwas zusammen unternehmen?",
+    "redemittel": [
+      "Tolle Idee",
+      "Nach Hamburg fahren",
+      "Viele Aktivitäten"
+    ],
+    "suggestedAnswer": "Sehr gerne! Wir könnten zusammen nach Hamburg fahren, dort gibt es im Sommer wirklich viele tolle Aktivitäten."
+  }
+]
