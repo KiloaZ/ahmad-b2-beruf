@@ -2,14 +2,14 @@ import { initializeApp, getApps } from "firebase/app";
 import { getDatabase } from "firebase/database";
 
 const firebaseConfig = {
-  apiKey: "AIzaSyCuCigFubiGOMHgka4L54gbKTX9PTVqrSo",
-  authDomain: "b2-beruf.firebaseapp.com",
-  databaseURL: "https://b2-beruf-default-rtdb.europe-west1.firebasedatabase.app",
-  projectId: "b2-beruf",
-  storageBucket: "b2-beruf.firebasestorage.app",
-  messagingSenderId: "995920646513",
-  appId: "1:995920646513:web:c5e0e4b8d695270906e6d0",
-  measurementId: "G-XVX53GE94L"
+  apiKey:            import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain:        import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  databaseURL:       import.meta.env.VITE_FIREBASE_DATABASE_URL,
+  projectId:         import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket:     import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId:             import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId:     import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
 };
 
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
