@@ -1361,4 +1361,4 @@ const CSS = `
 .ssc-b{width:7px;border-radius:2.5px 2.5px 0 0;background:var(--sf3);height:var(--bh);}
 .ssc-b-on{background:linear-gradient(to top,#22d3ee,#6366f1);}
 .fin-results{width:100%;display:flex;flex-direction:column;gap:18px;}
-`}
+`
