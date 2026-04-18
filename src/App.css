@@ -419,3 +419,28 @@ a:hover { color: #74b4ff; }
   margin-top: 10px;
   font-weight: bold;
 }
+
+/* إضافات ضرورية للـ Turn Controller والـ Dual-Path Sync */
+.cr-mic-locked {
+  opacity: 0.5;
+  filter: grayscale(1);
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
+
+.cr-transcript-final {
+  color: #ffffff;
+}
+
+.cr-transcript-interim {
+  color: rgba(255, 255, 255, 0.38);
+  font-style: italic;
+}
+
+.cr-turn-badge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  display: inline-block;
+}
