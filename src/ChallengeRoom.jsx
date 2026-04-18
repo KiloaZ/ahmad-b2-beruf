@@ -1,46 +1,13 @@
 /**
- * ChallengeRoom.jsx — B2 Beruf · v7 Full-Sync
+ * ChallengeRoom.jsx — B2 Beruf · v8 Fast-Eval
  *
- * ══════════════════════════════════════════════════════════════════════
- *  FIREBASE DATA SHAPE
- * ══════════════════════════════════════════════════════════════════════
- *
- *  rooms/{roomId}/
- *    roomState/                     ← control plane (low-write)
- *      status            string     'intro'|'prep'|'speaking'|'analyzing'|'results'|'switching'|'finished'
- *      currentSpeaker    uid        who is Room Master this turn
- *      timerPhase        string     'prep'|'speak'
- *      timerEndsAt       number|null epoch-ms when current phase ends
- *      currentQuestionId string
- *      round             number     1|2
- *      speakerOrder      [uid,uid]  set once at room creation — never changes
- *
- *    transcript/{uid}/              ← high-write, SEPARATE from roomState (I-2)
- *      text              string     accumulated final transcript
- *      interim           string     current partial chunk
- *      updatedAt         number     epoch-ms
- *
- *    results/                       ← written once per round, triggers UI on both (I-3)
- *      round1            object|null feedbackObj
- *      round2            object|null feedbackObj
- *
- *    analyzing/{uid}    boolean     scalar overlay flag — no merge race (I-8)
- *
- *    players/                       ← written by matchmaking only
- *      A/ {uid, displayName}
- *      B/ {uid, displayName}
- *
- * ══════════════════════════════════════════════════════════════════════
- *  INVARIANTS
- * ══════════════════════════════════════════════════════════════════════
- *  I-1  setRs called ONLY inside onValue(roomState) in multi mode
- *  I-2  Transcript → transcript/{uid}, never inside roomState
- *  I-3  Results → results/round{N}; both clients listen; screen appears on data arrival
- *  I-4  masterEndsAtRef prevents countdown restart on unrelated snapshots
- *  I-5  amSpeaker derived from confirmed Firebase state, never optimistic
- *  I-6  Mic active ONLY when status==='speaking' && amSpeaker && isRecording
- *  I-7  Page refresh: onValue fires immediately → full state restored automatically
- *  I-8  analyzingFlag = scalar boolean at analyzing/{uid}, each client owns only theirs
+ * Changes from v7:
+ *  - AI_SYSTEM prompt shortened for speed
+ *  - fetchAI: max_tokens 900→400, temperature 0.25→0, response_format json_object
+ *  - fetchAI: transcript capped at 600 chars
+ *  - handleSpeakEnd: Promise.all to run fetchAI + Firebase in parallel (biggest gain)
+ *  - Relevance checking enforced: off-topic → score 2
+ *  - isOffTopic badge shown in ResultCard
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -94,49 +61,18 @@ const PREP_SEC  = 30;
 const SPEAK_SEC = 180;
 const OA_KEY    = import.meta.env.VITE_OPENAI_API_KEY;
 
-const AI_SYSTEM = `You are a strict German language examiner for B2 Beruf oral exams.
+// ── Shortened prompt for speed ────────────────────────────────────────────────
+const AI_SYSTEM = `You are a German B2 oral exam evaluator. You receive a TASK and a RESPONSE.
 
-You receive TWO inputs:
-1. TASK — the question/prompt the candidate was given
-2. RESPONSE — what the candidate actually said
+Evaluate on TWO criteria:
+1. RELEVANCE: Does the response address the task? If off-topic -> score must be 2.
+2. LANGUAGE: Grammar, vocabulary, fluency (B2 level).
 
-Your job is to evaluate BOTH dimensions equally:
+Scoring: 5=on-topic+fluent, 4=on-topic+good, 3=partial/many errors, 2=off-topic or very poor.
+A grammatically perfect but off-topic answer MUST score 2.
 
-━━━ DIMENSION 1: RELEVANCE (50% of score) ━━━
-- Does the response DIRECTLY address the task?
-- Does it stay on topic throughout?
-- Does it answer what was actually asked?
-- If the response is off-topic, tangential, or ignores the task → score MUST be 2, regardless of grammar.
-- Flag off-topic responses explicitly in feedback.
-
-━━━ DIMENSION 2: LANGUAGE (50% of score) ━━━
-- Grammar correctness (B2 level structures)
-- Vocabulary range and appropriateness
-- Fluency and coherence
-
-━━━ SCORING RULES ━━━
-5 = On-topic AND fluent, minor or no errors
-4 = On-topic AND good, some noticeable errors
-3 = Partially on-topic OR understandable but many errors
-2 = Off-topic OR very poor language (even if grammatically correct sentences appear)
-NOTE: A grammatically perfect but off-topic answer MUST score 2.
-
-Return ONLY a valid JSON object — no markdown, no prose, no explanation outside JSON.
-
-Schema:
-{
-  "score": <int 2-5>,
-  "isOffTopic": <boolean — true if response does not address the task>,
-  "correctedText": "<full corrected version of what they said, keeping their meaning>",
-  "feedback": "<2-3 sentences in German — mention relevance first, then language quality>",
-  "errors": [
-    {
-      "original": "<wrong phrase>",
-      "correction": "<correct phrase>",
-      "explanation": "<brief explanation in German>"
-    }
-  ]
-}`;
+Return ONLY compact JSON, no markdown:
+{"score":<2-5>,"isOffTopic":<bool>,"correctedText":"<corrected>","feedback":"<2 sentences in German>","errors":[{"original":"<wrong>","correction":"<right>","explanation":"<German>"}]}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -163,7 +99,7 @@ function buildHighlightedHTML(text = "", errors = []) {
   return out;
 }
 
-// Android / Samsung dedup (v5)
+// Android / Samsung dedup
 function lev(a, b, cap = 40) {
   if (Math.abs(a.length - b.length) > cap) return cap + 1;
   const row = Array.from({ length: b.length + 1 }, (_, i) => i);
@@ -199,22 +135,43 @@ function sanitize(existing, chunk) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAI
+// OpenAI — fast path
+//  • max_tokens 400 (was 900)
+//  • temperature 0   (was 0.25)
+//  • response_format json_object  → no parse retry needed
+//  • transcript capped at 600 chars
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchAI(transcript, question) {
   if (!OA_KEY || !transcript?.trim()) return null;
+
+  // Cap transcript to 600 chars — enough for B2 evaluation
+  const trimmedTranscript = transcript.trim().slice(0, 600);
+
   const userContent = question
-    ? `TASK:\n${question}\n\nRESPONSE:\n${transcript.trim()}`
-    : `RESPONSE:\n${transcript.trim()}`;
+    ? `TASK: ${question}\nRESPONSE: ${trimmedTranscript}`
+    : `RESPONSE: ${trimmedTranscript}`;
+
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method:"POST",
-    headers:{"Content-Type":"application/json", Authorization:`Bearer ${OA_KEY}`},
-    body:JSON.stringify({
-      model:"gpt-4o-mini", max_tokens:900, temperature:0.25,
-      messages:[{role:"system",content:AI_SYSTEM},{role:"user",content:userContent}],
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OA_KEY}` },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      max_tokens: 400,
+      temperature: 0,
+      response_format: { type: "json_object" }, // guarantees clean JSON output
+      messages: [
+        { role: "system", content: AI_SYSTEM },
+        { role: "user",   content: userContent },
+      ],
     }),
   });
+  if (!res.ok) throw new Error(`OpenAI ${res.status}`);
+  const data = await res.json();
+  const raw  = data.choices?.[0]?.message?.content || "";
+  try   { return JSON.parse(raw); }
+  catch { console.error("AI JSON parse:", raw); return null; }
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Speech Recognition Hook
 // ─────────────────────────────────────────────────────────────────────────────
@@ -314,7 +271,7 @@ function CircularTimer({ timeLeft, totalTime, phase }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LiveTranscriptPanel — streams to BOTH users via Firebase
+// LiveTranscriptPanel
 // ─────────────────────────────────────────────────────────────────────────────
 function LiveTranscriptPanel({ speakerName, text="", interim="", isMine }) {
   const bottomRef = useRef(null);
@@ -338,8 +295,7 @@ function LiveTranscriptPanel({ speakerName, text="", interim="", isMine }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ResultCard — shown to BOTH users simultaneously (I-3)
-// Original text with errors in RED, corrected version in GREEN below
+// ResultCard — with isOffTopic badge
 // ─────────────────────────────────────────────────────────────────────────────
 function ResultCard({ result, speakerName, roundNum, isLoading }) {
   if (isLoading) return (
@@ -354,17 +310,17 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
     </div>
   );
   if (!result) return null;
-  const { score=0, correctedText, feedback, errors=[], transcript:origText } = result;
+  const { score=0, isOffTopic=false, correctedText, feedback, errors=[], transcript:origText } = result;
   const html = buildHighlightedHTML(origText, errors);
   return (
     <div className="rc-card" style={{animationDelay:"0ms"}}>
       {/* Header */}
-     <div className="rc-head">
-  <span className="rc-round-tag">Runde {roundNum}</span>
-  {result.isOffTopic && (
-    <span className="rc-offtopic-badge">⚠ Off-topic</span>
-  )}
-  <span className="rc-who">{speakerName}</span>
+      <div className="rc-head">
+        <span className="rc-round-tag">Runde {roundNum}</span>
+        {isOffTopic && (
+          <span className="rc-offtopic-badge">⚠ Off-topic</span>
+        )}
+        <span className="rc-who">{speakerName}</span>
         <div className="rc-score-bar">
           {[1,2,3,4,5].map(b=>(
             <div key={b} className={`rc-bar-seg${b<=score?" rc-bar-on":""}`}
@@ -374,7 +330,7 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
         </div>
       </div>
 
-      {/* ── Original with errors in RED ── */}
+      {/* Original with errors in RED */}
       {origText && (
         <div className="rc-sec">
           <div className="rc-label"><span className="rc-dot rc-dot-red"/>Original · Fehler markiert</div>
@@ -382,7 +338,7 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
         </div>
       )}
 
-      {/* ── Corrected version in GREEN ── */}
+      {/* Corrected version in GREEN */}
       {correctedText && (
         <div className="rc-sec">
           <div className="rc-label"><span className="rc-dot rc-dot-green"/>Korrigierte Version</div>
@@ -390,7 +346,7 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
         </div>
       )}
 
-      {/* ── Error table ── */}
+      {/* Error table */}
       {errors.length>0 && (
         <div className="rc-sec">
           <div className="rc-label"><span className="rc-dot rc-dot-amber"/>Fehler ({errors.length})</div>
@@ -407,7 +363,7 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
         </div>
       )}
 
-      {/* ── Feedback ── */}
+      {/* Feedback */}
       {feedback && (
         <div className="rc-sec rc-sec-last">
           <div className="rc-label"><span className="rc-dot rc-dot-cyan"/>Feedback</div>
@@ -419,7 +375,7 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AnalyzingOverlay — both users see this simultaneously
+// AnalyzingOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 function AnalyzingOverlay({ speakerName }) {
   return (
@@ -499,9 +455,7 @@ function MicOnIcon()  { return <svg width="14" height="14" viewBox="0 0 24 24" f
 function MicOffIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>; }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-//  MAIN COMPONENT
-// ═══════════════════════════════════════════════════════════════════════════
+// MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
 export default function ChallengeRoom({
   mode        = "solo",
@@ -515,43 +469,37 @@ export default function ChallengeRoom({
   const isSolo = mode==="solo";
   const isMulti= mode==="multi";
 
-  // ── Control plane — I-1: setRs called ONLY from onValue in multi ──────────
   const [rs, setRs] = useState({
     status:"intro", currentSpeaker:me.uid, timerPhase:"prep",
     timerEndsAt:null, currentQuestionId:null, round:1,
     speakerOrder:[me.uid],
   });
 
-  // ── Data plane (separate listeners) ──────────────────────────────────────
-  const [transcripts,  setTranscripts]  = useState({});   // {[uid]:{text,interim}}
-  const [roundResults, setRoundResults] = useState({});   // {round1:obj, round2:obj}
-  const [analyzingMap, setAnalyzingMap] = useState({});   // {[uid]:boolean}
+  const [transcripts,  setTranscripts]  = useState({});
+  const [roundResults, setRoundResults] = useState({});
+  const [analyzingMap, setAnalyzingMap] = useState({});
 
-  // ── Player info ───────────────────────────────────────────────────────────
   const [partnerUid,  setPartnerUid]  = useState(null);
   const [partnerName, setPartnerName] = useState("Partner");
   const [fbReady,     setFbReady]     = useState(!isMulti);
 
-  // ── Local UI ──────────────────────────────────────────────────────────────
   const [isRecording,     setIsRecording]     = useState(false);
   const [showExitConfirm, setShowExitConfirm] = useState(false);
   const [phaseAnim,       setPhaseAnim]       = useState("in");
   const [soloUsedIds,     setSoloUsedIds]     = useState([]);
 
-  // ── Refs ──────────────────────────────────────────────────────────────────
   const transcriptRef   = useRef("");
   const rsRef           = useRef(rs);
   const partnerUidRef   = useRef(null);
   const masterTimerRef  = useRef(null);
-  const masterEndsAtRef = useRef(null); // I-4
+  const masterEndsAtRef = useRef(null);
 
   useEffect(()=>{ rsRef.current=rs; },[rs]);
   useEffect(()=>{ partnerUidRef.current=partnerUid; },[partnerUid]);
   useEffect(()=>()=>clearInterval(masterTimerRef.current),[]);
 
-  // ── Derived ───────────────────────────────────────────────────────────────
   const status    = rs.status;
-  const amSpeaker = rs.currentSpeaker===me.uid;                      // I-5
+  const amSpeaker = rs.currentSpeaker===me.uid;
   const totalSec  = rs.timerPhase==="prep"?PREP_SEC:SPEAK_SEC;
   const currentQ  = propQ.find(q=>q.id===rs.currentQuestionId)||null;
   const roundKey  = `round${rs.round}`;
@@ -568,14 +516,11 @@ export default function ChallengeRoom({
 
   const timeLeft = useTimerDisplay(rs.timerEndsAt, totalSec);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Firebase listeners — I-1, I-7
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Firebase listeners ────────────────────────────────────────────────────
   useEffect(()=>{
     if (!isMulti||!roomId) return;
     const cls=[];
     (async()=>{
-      // Players
       cls.push(await fbListen(`rooms/${roomId}/players`, players=>{
         if (!players) return;
         const amA = players.A?.uid===me.uid;
@@ -584,12 +529,10 @@ export default function ChallengeRoom({
         if (p?.uid)         setPartnerUid(p.uid);
       }));
 
-      // roomState — I-1: ONLY place setRs is called in multi
       cls.push(await fbListen(`rooms/${roomId}/roomState`, data=>{
         setFbReady(true);
         if (!data) return;
         setRs(prev=>({...prev,...data}));
-        // I-4: restart countdown only when timerEndsAt truly changes
         if (data.currentSpeaker===me.uid && data.timerEndsAt && data.timerEndsAt!==masterEndsAtRef.current) {
           masterEndsAtRef.current=data.timerEndsAt;
           _startCountdown(data.timerEndsAt, data.timerPhase, data.currentQuestionId);
@@ -599,20 +542,16 @@ export default function ChallengeRoom({
         }
       }));
 
-      // I-2: Transcript at separate path — single subtree listener
       cls.push(await fbListen(`rooms/${roomId}/transcript`, data=>{
         if (!data) return;
         setTranscripts(prev=>({...prev,...data}));
-        // I-7: keep transcriptRef synced on refresh
         if (data[me.uid]?.text!==undefined) transcriptRef.current=data[me.uid].text||"";
       }));
 
-      // I-3: Results — both clients listen; UI appears on data arrival
       cls.push(await fbListen(`rooms/${roomId}/results`, data=>{
         if (data) setRoundResults(data);
       }));
 
-      // I-8: Analyzing flags
       cls.push(await fbListen(`rooms/${roomId}/analyzing`, data=>{
         setAnalyzingMap(data||{});
       }));
@@ -620,21 +559,16 @@ export default function ChallengeRoom({
     return ()=>cls.forEach(fn=>fn?.());
   },[isMulti,roomId]);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // pushRS — I-1: never calls setRs in multi
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── pushRS ────────────────────────────────────────────────────────────────
   const pushRS = useCallback(async partial=>{
     if (isMulti&&roomId) {
       await fbUpdate(`rooms/${roomId}/roomState`, partial);
-      // setRs follows via onValue — do NOT call it here
     } else {
       setRs(prev=>({...prev,...partial}));
     }
   },[isMulti,roomId]);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Transcript write — I-2: always separate path
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Transcript write ──────────────────────────────────────────────────────
   const writeTx = useCallback(async(field,value)=>{
     if (isMulti&&roomId) {
       await fbSet(`rooms/${roomId}/transcript/${me.uid}/${field}`, value);
@@ -644,9 +578,7 @@ export default function ChallengeRoom({
     }
   },[isMulti,roomId,me.uid]);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Master countdown — I-4 guard
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Master countdown ──────────────────────────────────────────────────────
   function _startCountdown(endsAt, phase, questionId) {
     clearInterval(masterTimerRef.current);
     masterTimerRef.current=setInterval(()=>{
@@ -664,9 +596,7 @@ export default function ChallengeRoom({
     },400);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Speech handlers
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Speech handlers ───────────────────────────────────────────────────────
   const handleFinal = useCallback(raw=>{
     const clean=sanitize(transcriptRef.current,raw);
     if (!clean) return;
@@ -678,7 +608,6 @@ export default function ChallengeRoom({
 
   const handleInterim = useCallback(text=>{ writeTx("interim",text); },[writeTx]);
 
-  // I-6: mic active only when correct conditions
   const micActive = status==="speaking" && amSpeaker && isRecording;
 
   const {start:startRecog,stop:stopRecog} = useSpeechRecognition({
@@ -689,9 +618,7 @@ export default function ChallengeRoom({
     return ()=>stopRecog();
   },[micActive]);
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Phase animation
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Phase animation ───────────────────────────────────────────────────────
   function anim(cb) {
     setPhaseAnim("out");
     setTimeout(()=>{ cb?.(); setPhaseAnim("in"); },200);
@@ -702,15 +629,11 @@ export default function ChallengeRoom({
     setShowExitConfirm(true);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Game flow
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Game flow ─────────────────────────────────────────────────────────────
   async function beginPrep(speakerUid, roundNum) {
     if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
     transcriptRef.current="";
 
-    // Clear transcripts for fresh round
     if (isMulti&&roomId) {
       await fbSet(`rooms/${roomId}/transcript/${me.uid}`,{text:"",interim:"",updatedAt:Date.now()});
       const pUid=partnerUidRef.current;
@@ -749,33 +672,37 @@ export default function ChallengeRoom({
     await _doBeginSpeaking();
   }
 
-  /** End Turn button + timer expiry */
+  // ── handleSpeakEnd — FAST PATH with Promise.all ───────────────────────────
   async function handleSpeakEnd() {
     if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
     clearInterval(masterTimerRef.current); masterEndsAtRef.current=null;
     setIsRecording(false); stopRecog();
     playBeep({freq:440,gain:.3});
 
-    const finalText=transcriptRef.current;
-    const curRound=rsRef.current.round;
-    const curRKey=`round${curRound}`;
+    const finalText    = transcriptRef.current;
+    const curRound     = rsRef.current.round;
+    const curRKey      = `round${curRound}`;
+    const questionText = currentQ?.question; // capture before any state change
 
-    // I-8: scalar boolean flag
-    const flagPath=isMulti&&roomId?`rooms/${roomId}/analyzing/${me.uid}`:null;
-    if (flagPath) await fbSet(flagPath,true);
-    else setAnalyzingMap(p=>({...p,[me.uid]:true}));
+    const flagPath = isMulti&&roomId ? `rooms/${roomId}/analyzing/${me.uid}` : null;
 
-    await pushRS({status:"analyzing",timerEndsAt:null});
+    // ── Run fetchAI + Firebase flag + status update ALL in parallel ──────────
+    // This is the key speed improvement: AI call starts immediately
+    const [aiResult] = await Promise.all([
+      fetchAI(finalText, questionText),
+      flagPath
+        ? fbSet(flagPath, true)
+        : Promise.resolve(setAnalyzingMap(p=>({...p,[me.uid]:true}))),
+      pushRS({status:"analyzing", timerEndsAt:null}),
+    ]);
+
     anim();
 
     try {
-	const result=await fetchAI(finalText, currentQ?.question);   
-   if (result) {
-        const payload={...result,transcript:finalText,speakerUid:me.uid};
-        // I-3: write to results/round{N} — both clients' listeners pick it up
-        if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`,payload);
+      if (aiResult) {
+        const payload = {...aiResult, transcript:finalText, speakerUid:me.uid};
+        if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
         else setRoundResults(p=>({...p,[curRKey]:payload}));
-        // Status → results; both clients show ResultCard simultaneously
         await pushRS({status:"results"});
         anim();
       }
@@ -784,12 +711,11 @@ export default function ChallengeRoom({
       await pushRS({status:"results"});
       anim();
     } finally {
-      if (flagPath) await fbSet(flagPath,false);
+      if (flagPath) await fbSet(flagPath, false);
       else setAnalyzingMap(p=>({...p,[me.uid]:false}));
     }
   }
 
-  /** Next Round — called by current speaker, switches to partner */
   async function handleNextRound() {
     if (!amSpeaker) return;
     const order=rsRef.current.speakerOrder||[me.uid,partnerUidRef.current||me.uid];
@@ -798,7 +724,6 @@ export default function ChallengeRoom({
     anim();
   }
 
-  /** I-5: only confirmed new speaker can start their round */
   async function handleStartMyRound() {
     if (!amSpeaker) return;
     await beginPrep(me.uid, rsRef.current.round);
@@ -809,9 +734,7 @@ export default function ChallengeRoom({
     anim();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <>
       <style>{CSS}</style>
@@ -832,7 +755,7 @@ export default function ChallengeRoom({
           />
         )}
 
-        {/* ── HEADER ── */}
+        {/* HEADER */}
         <header className="cr-hdr">
           <div className="cr-logo">
             <div className="cr-logo-mark">B2</div>
@@ -861,10 +784,10 @@ export default function ChallengeRoom({
           </div>
         </header>
 
-        {/* ── MAIN ── */}
+        {/* MAIN */}
         <main className={`cr-main cr-a-${phaseAnim}`}>
 
-          {/* ══ INTRO ══════════════════════════════════════════════════════ */}
+          {/* INTRO */}
           {status==="intro"&&(
             <div className="intro-wrap">
               <div className="intro-img-side">
@@ -896,7 +819,7 @@ export default function ChallengeRoom({
             </div>
           )}
 
-          {/* ══ PREP ════════════════════════════════════════════════════════ */}
+          {/* PREP */}
           {status==="prep"&&currentQ&&(
             <div className="game-lay">
               <div className="game-l">
@@ -918,14 +841,13 @@ export default function ChallengeRoom({
             </div>
           )}
 
-          {/* ══ SPEAKING ════════════════════════════════════════════════════ */}
+          {/* SPEAKING */}
           {status==="speaking"&&currentQ&&(
             <div className="game-lay">
               <div className="game-l">
                 <CircularTimer timeLeft={timeLeft} totalTime={SPEAK_SEC} phase="speak"/>
                 <div className="ph-badge ph-spk">Sprechen</div>
 
-                {/* Mic toggle — speaker only (I-6) */}
                 {amSpeaker&&(
                   <button className={`btn-mic${isRecording?" btn-mic-on":""}`}
                     onClick={()=>setIsRecording(r=>!r)}>
@@ -933,7 +855,6 @@ export default function ChallengeRoom({
                   </button>
                 )}
 
-                {/* I-6: listener sees locked mic with no pointer events */}
                 {!amSpeaker&&isMulti&&(
                   <div className="waiting-banner">
                     <span className="wait-dot"/>
@@ -942,7 +863,6 @@ export default function ChallengeRoom({
                   </div>
                 )}
 
-                {/* End Turn — speaker only */}
                 {amSpeaker&&(
                   <button className="btn-danger" onClick={handleSpeakEnd}>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
@@ -958,8 +878,6 @@ export default function ChallengeRoom({
                   <p className="q-text">{currentQ.question}</p>
                 </div>
                 {currentQ.redemittel?.length>0&&<RedemittelPanel items={currentQ.redemittel}/>}
-
-                {/* Live transcript — BOTH users see this stream in real time */}
                 <LiveTranscriptPanel
                   speakerName={speakerDisplayName}
                   text={speakerTx.text}
@@ -970,7 +888,7 @@ export default function ChallengeRoom({
             </div>
           )}
 
-          {/* ══ ANALYZING ══════════════════════════════════════════════════ */}
+          {/* ANALYZING */}
           {status==="analyzing"&&(
             <div className="center-stage">
               <div className="center-card">
@@ -986,7 +904,7 @@ export default function ChallengeRoom({
             </div>
           )}
 
-          {/* ══ RESULTS — displayed simultaneously on BOTH clients (I-3) ══ */}
+          {/* RESULTS */}
           {status==="results"&&(
             <div className="res-lay">
               <div className="res-hdr">
@@ -999,7 +917,6 @@ export default function ChallengeRoom({
                 )}
               </div>
 
-              {/* ResultCard with red-highlighted errors + green corrected text */}
               <ResultCard
                 result={currentRoundResult}
                 speakerName={speakerDisplayName}
@@ -1008,13 +925,11 @@ export default function ChallengeRoom({
               />
 
               <div className="res-actions">
-                {/* Round 1 → Next Round */}
                 {rs.round===1&&(
                   amSpeaker||isSolo
                     ? <button className="btn-p" onClick={handleNextRound}>Nächste Runde →</button>
                     : <p className="wait-txt"><span className="wait-dot"/>Warte auf {speakerDisplayName}…</p>
                 )}
-                {/* Round 2 → Finish */}
                 {rs.round>=2&&(
                   amSpeaker||isSolo
                     ? <button className="btn-p" onClick={handleFinish}>Abschlussergebnis →</button>
@@ -1024,7 +939,7 @@ export default function ChallengeRoom({
             </div>
           )}
 
-          {/* ══ SWITCHING ══════════════════════════════════════════════════ */}
+          {/* SWITCHING */}
           {status==="switching"&&(
             <div className="center-stage">
               <div className="sw-card">
@@ -1039,7 +954,6 @@ export default function ChallengeRoom({
                   Runde {rs.round} beginnt. Sprecher:&nbsp;
                   <strong className="sw-name">{amSpeaker?"Du":partnerName}</strong>
                 </p>
-                {/* I-5: only confirmed new speaker sees this button */}
                 {amSpeaker
                   ? <button className="btn-p" onClick={handleStartMyRound}>Runde {rs.round} starten →</button>
                   : <p className="wait-txt"><span className="wait-dot"/>Warte auf {partnerName}…</p>
@@ -1048,7 +962,7 @@ export default function ChallengeRoom({
             </div>
           )}
 
-          {/* ══ FINISHED ═══════════════════════════════════════════════════ */}
+          {/* FINISHED */}
           {status==="finished"&&(
             <div className="fin-lay">
               <div className="fin-hero">
@@ -1057,7 +971,6 @@ export default function ChallengeRoom({
                 <p className="fin-sub">Hervorragende Arbeit!</p>
               </div>
 
-              {/* Score summary */}
               <div className="fin-scores">
                 {[round1Result,round2Result].map((r,i)=>r&&(
                   <div key={i} className="ssc">
@@ -1073,7 +986,6 @@ export default function ChallengeRoom({
                 ))}
               </div>
 
-              {/* Full result cards */}
               <div className="fin-results">
                 {round1Result&&(
                   <ResultCard result={round1Result} roundNum={1}
@@ -1122,7 +1034,6 @@ const CSS = `
   display:flex;flex-direction:column;
 }
 
-/* Ambient */
 .cr-grid{position:fixed;inset:0;pointer-events:none;z-index:0;
   background-image:linear-gradient(rgba(34,211,238,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,.022) 1px,transparent 1px);
   background-size:56px 56px;}
@@ -1131,7 +1042,6 @@ const CSS = `
 .cr-amb2{position:fixed;width:480px;height:480px;border-radius:50%;bottom:-120px;right:-80px;pointer-events:none;z-index:0;
   background:radial-gradient(circle,rgba(99,102,241,.05) 0%,transparent 65%);}
 
-/* Keyframes */
 @keyframes cr-spin  {to{transform:rotate(360deg)}}
 @keyframes cr-fadeup{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
 @keyframes cr-glow  {0%,100%{opacity:.6}50%{opacity:1}}
@@ -1140,7 +1050,6 @@ const CSS = `
 @keyframes cr-pulse {0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
 @keyframes cr-slide {from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
 
-/* Header */
 .cr-hdr{display:flex;align-items:center;gap:14px;padding:14px 26px;
   border-bottom:1px solid var(--b);background:rgba(8,12,20,.92);
   backdrop-filter:blur(20px);position:sticky;top:0;z-index:100;flex-shrink:0;}
@@ -1166,12 +1075,10 @@ const CSS = `
 .cr-x:hover:not(:disabled){background:var(--sf3);color:var(--tx);border-color:rgba(255,255,255,.2);}
 .cr-x-locked{opacity:.3;cursor:not-allowed;pointer-events:none;}
 
-/* Main */
 .cr-main{flex:1;position:relative;z-index:1;}
 .cr-a-in {animation:cr-slide .25s ease;}
 .cr-a-out{opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;}
 
-/* Overlays */
 .ol-wrap{position:fixed;inset:0;z-index:900;background:rgba(4,7,14,.9);backdrop-filter:blur(22px);
   display:flex;align-items:center;justify-content:center;padding:24px;animation:cr-fadeup .28s ease;}
 .ol-card{background:linear-gradient(145deg,#111827,#0a1020);border:1px solid var(--b3);border-radius:var(--r);
@@ -1200,7 +1107,6 @@ const CSS = `
 .modal-btn-g{background:var(--sf2);color:var(--mu);border-color:var(--b2);}
 .modal-btn-g:hover{background:var(--sf3);color:var(--tx);}
 
-/* Intro */
 .intro-wrap{display:grid;grid-template-columns:1fr 1fr;min-height:calc(100vh - 64px);}
 @media(max-width:768px){.intro-wrap{grid-template-columns:1fr;}}
 .intro-img-side{position:relative;overflow:hidden;}
@@ -1218,7 +1124,6 @@ const CSS = `
 .intro-meta-item{display:flex;align-items:center;gap:6px;font-size:11px;color:rgba(255,255,255,.4);background:var(--sf2);border:1px solid var(--b);padding:5px 11px;border-radius:100px;}
 .intro-conn{color:var(--cy);font-size:13px;animation:cr-blink 1.5s ease-in-out infinite;}
 
-/* Buttons */
 .btn-p{display:inline-flex;align-items:center;gap:10px;
   background:linear-gradient(135deg,#0891b2,#6366f1);color:#fff;border:none;
   padding:13px 30px;border-radius:100px;font-family:var(--fd);font-size:14px;font-weight:700;cursor:pointer;
@@ -1235,13 +1140,11 @@ const CSS = `
 .btn-danger{display:inline-flex;align-items:center;gap:6px;background:var(--re2);border:1px solid rgba(248,113,113,.3);color:var(--re);font-family:var(--fd);font-size:12px;font-weight:600;padding:9px 18px;border-radius:100px;cursor:pointer;transition:all .2s;}
 .btn-danger:hover{background:rgba(248,113,113,.22);}
 
-/* Game layout */
 .game-lay{display:grid;grid-template-columns:180px 1fr;gap:28px;padding:32px 36px;max-width:1020px;margin:0 auto;width:100%;align-items:start;}
 @media(max-width:740px){.game-lay{grid-template-columns:1fr;padding:18px 14px;gap:18px;}}
 .game-l{display:flex;flex-direction:column;align-items:center;gap:12px;position:sticky;top:82px;}
 .game-r{display:flex;flex-direction:column;gap:12px;}
 
-/* Timer */
 .tmr-wrap{filter:drop-shadow(0 0 16px rgba(34,211,238,.1));}
 .tmr-urgent{animation:cr-pulse .72s ease-in-out infinite;}
 .ph-badge{font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:4px 13px;border-radius:100px;}
@@ -1255,7 +1158,6 @@ const CSS = `
 .wait-lock{font-size:10px;color:var(--dm);}
 .wait-txt{display:flex;align-items:center;gap:7px;color:var(--mu);font-size:13px;}
 
-/* Question */
 .q-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:24px 28px;position:relative;overflow:hidden;box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 10px 28px rgba(0,0,0,.4);}
 .q-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(34,211,238,.28),transparent);}
 .q-card-sm{padding:16px 20px;}
@@ -1263,7 +1165,6 @@ const CSS = `
 .q-topic{font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--cy);margin-bottom:9px;}
 .q-text{font-family:var(--fb);font-size:16px;line-height:1.78;color:var(--tx);}
 
-/* Redemittel */
 .rdm{background:rgba(255,255,255,.02);border:1px solid var(--b);border-radius:var(--rs);overflow:hidden;transition:border-color .25s;}
 .rdm-open{border-color:rgba(34,211,238,.18);}
 .rdm-toggle{width:100%;background:none;border:none;color:var(--mu);font-family:var(--fd);font-size:10.5px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:12px 15px;display:flex;align-items:center;gap:7px;cursor:pointer;transition:color .2s;}
@@ -1274,7 +1175,6 @@ const CSS = `
 .rdm-item:hover{color:rgba(255,255,255,.72);}
 .rdm-dot{width:3.5px;height:3.5px;border-radius:50%;background:var(--cy);margin-top:8px;flex-shrink:0;}
 
-/* Live Transcript */
 .tp-panel{border-radius:var(--rs);overflow:hidden;border:1px solid;}
 .tp-mine{background:rgba(34,211,238,.04);border-color:rgba(34,211,238,.18);}
 .tp-partner{background:rgba(99,102,241,.04);border-color:rgba(99,102,241,.18);}
@@ -1287,13 +1187,11 @@ const CSS = `
 .tp-final{color:var(--tx);}
 .tp-interim{color:rgba(255,255,255,.32);font-style:italic;}
 
-/* Center stage */
 .center-stage{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 110px);padding:40px 24px;}
 .center-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:56px 44px;text-align:center;max-width:400px;width:100%;box-shadow:0 28px 56px rgba(0,0,0,.5);display:flex;flex-direction:column;align-items:center;gap:4px;}
 .cc-title{font-family:var(--fd);font-size:22px;font-weight:700;color:#fff;}
 .cc-sub{font-size:13px;color:var(--mu);}
 
-/* Results */
 .res-lay{max-width:740px;margin:0 auto;padding:32px 28px;display:flex;flex-direction:column;gap:22px;}
 @media(max-width:768px){.res-lay{padding:18px 14px;}}
 .res-hdr{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
@@ -1302,13 +1200,13 @@ const CSS = `
 .res-sync-dot{width:5px;height:5px;border-radius:50%;background:var(--gr);box-shadow:0 0 5px var(--gr);animation:cr-glow 2s ease-in-out infinite;}
 .res-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
 
-/* Result card */
 .rc-card{background:rgba(255,255,255,.025);backdrop-filter:blur(18px);border:1px solid rgba(34,211,238,.16);border-radius:var(--r);padding:26px 28px;box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 14px 42px rgba(0,0,0,.45);position:relative;overflow:hidden;animation:cr-slide .32s ease both;}
 .rc-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(34,211,238,.38),transparent);}
 .rc-loading{display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px;border-color:var(--b2);}
 .rc-loading-txt{font-family:var(--fd);font-size:13px;color:var(--mu);}
 .rc-head{display:flex;align-items:center;gap:12px;margin-bottom:22px;flex-wrap:wrap;}
 .rc-round-tag{background:var(--cy2);border:1px solid var(--b3);color:var(--cy);font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:3px 11px;border-radius:100px;}
+.rc-offtopic-badge{background:var(--re2);border:1px solid rgba(248,113,113,.3);color:var(--re);font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:3px 11px;border-radius:100px;}
 .rc-who{font-family:var(--fd);font-size:13px;font-weight:600;color:rgba(255,255,255,.65);flex:1;}
 .rc-score-bar{display:flex;align-items:flex-end;gap:3.5px;}
 .rc-bar-seg{width:5.5px;border-radius:2.5px 2.5px 0 0;background:var(--sf3);height:var(--bh);transition:background .4s;}
@@ -1324,11 +1222,8 @@ const CSS = `
 .rc-dot-amber{background:var(--am);box-shadow:0 0 4px var(--am);}
 .rc-dot-cyan {background:var(--cy);box-shadow:0 0 4px var(--cy);}
 
-/* ── Original text with errors in RED ── */
 .rc-orig{font-family:var(--fb);font-size:13.5px;line-height:1.82;color:rgba(255,255,255,.62);}
 .err-hl{color:var(--re);background:var(--re2);border-radius:3px;padding:1px 4px;font-style:italic;text-decoration:underline wavy rgba(248,113,113,.5);text-decoration-thickness:1.5px;}
-
-/* ── Corrected text in GREEN directly below ── */
 .rc-corr{font-family:var(--fb);font-size:13.5px;line-height:1.82;color:var(--gr);}
 
 .rc-errs{display:flex;flex-direction:column;gap:7px;}
@@ -1339,14 +1234,12 @@ const CSS = `
 .rc-err-exp{font-size:11px;color:var(--mu);font-style:italic;}
 .rc-feedback{font-family:var(--fb);font-size:13.5px;line-height:1.78;color:rgba(255,255,255,.58);}
 
-/* Switch */
 .sw-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:48px 40px;text-align:center;max-width:390px;width:100%;display:flex;flex-direction:column;align-items:center;gap:14px;box-shadow:0 28px 56px rgba(0,0,0,.5);}
 .sw-icon{width:58px;height:58px;border-radius:50%;background:var(--cy2);border:1px solid var(--b3);display:flex;align-items:center;justify-content:center;}
 .sw-title{font-family:var(--fd);font-size:24px;font-weight:800;color:#fff;}
 .sw-sub{font-size:13px;color:var(--mu);line-height:1.6;}
 .sw-name{color:var(--cy);font-weight:600;}
 
-/* Finished */
 .fin-lay{max-width:780px;margin:0 auto;padding:44px 28px;display:flex;flex-direction:column;align-items:center;gap:28px;}
 .fin-hero{text-align:center;}
 .fin-trophy{font-size:56px;margin-bottom:10px;}
@@ -1361,4 +1254,4 @@ const CSS = `
 .ssc-b{width:7px;border-radius:2.5px 2.5px 0 0;background:var(--sf3);height:var(--bh);}
 .ssc-b-on{background:linear-gradient(to top,#22d3ee,#6366f1);}
 .fin-results{width:100%;display:flex;flex-direction:column;gap:18px;}
-`
+`;
