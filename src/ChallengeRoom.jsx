@@ -1,10 +1,11 @@
 /**
  * ChallengeRoom.jsx — B2 Beruf Practice App
  * Full implementation: Hero bg image, slow-zoom animation, dark metallic theme,
- * circular SVG timer, glassmorphism Redemittel, Firebase multiplayer, round switching, exit modal.
+ * circular SVG timer, glassmorphism Redemittel, Firebase multiplayer, round switching,
+ * exit modal, Web Speech API live transcription, OpenAI AI feedback.
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
 // ── Firebase ─────────────────────────────────────────────────────────────────
 let _firebaseDb = null;
@@ -40,6 +41,16 @@ function playBeep({ freq = 880, duration = 0.18, type = "sine", gain = 0.35 } = 
 const PREP_DURATION  = 30;
 const SPEAK_DURATION = 180;
 
+const OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY;
+
+const OPENAI_SYSTEM_PROMPT = `You are a professional German language tutor. Analyze the user's transcript for grammar and vocabulary errors. Provide a JSON response with:
+- score (integer 1-5)
+- correctedText (the perfect version of what the user said)
+- feedback (concise, encouraging explanation in German, 2-4 sentences)
+- errors (array of objects: { original: string, correction: string })
+
+Respond ONLY with valid JSON. No markdown, no backticks.`;
+
 function pickRandom(questions, usedIds) {
   const pool = questions.filter(q => !usedIds.includes(q.id));
   const src  = pool.length > 0 ? pool : questions;
@@ -61,9 +72,115 @@ function scoreAnswer(userText, redemittel) {
   return { score, matched, missed, pct };
 }
 
+// ── Highlight errors in transcript ───────────────────────────────────────────
+function highlightErrors(text, errors = []) {
+  if (!text || !errors.length) return text;
+  let result = text;
+  errors.forEach(({ original }) => {
+    if (!original) return;
+    const escaped = original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    result = result.replace(
+      new RegExp(`(${escaped})`, "gi"),
+      `<span class="error-text">$1</span>`
+    );
+  });
+  return result;
+}
+
+// ── OpenAI feedback fetch ─────────────────────────────────────────────────────
+async function fetchAIFeedback(transcript) {
+  if (!OPENAI_API_KEY) {
+    console.warn("No VITE_OPENAI_API_KEY found.");
+    return null;
+  }
+  if (!transcript?.trim()) return null;
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      max_tokens: 800,
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: OPENAI_SYSTEM_PROMPT },
+        { role: "user", content: transcript.trim() },
+      ],
+    }),
+  });
+
+  if (!res.ok) throw new Error(`OpenAI error ${res.status}`);
+  const data = await res.json();
+  const raw  = data.choices?.[0]?.message?.content || "";
+  try {
+    const clean = raw.replace(/```json|```/g, "").trim();
+    return JSON.parse(clean);
+  } catch {
+    console.error("Failed to parse OpenAI response:", raw);
+    return null;
+  }
+}
+
+// ── Web Speech API hook ───────────────────────────────────────────────────────
+function useSpeechRecognition({ onInterim, onFinal, active }) {
+  const recogRef = useRef(null);
+  const activeRef = useRef(active);
+  useEffect(() => { activeRef.current = active; }, [active]);
+
+  const start = useCallback(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) { console.warn("Speech Recognition not supported."); return; }
+
+    if (recogRef.current) { try { recogRef.current.stop(); } catch {} }
+
+    const r = new SpeechRecognition();
+    r.continuous      = true;
+    r.interimResults  = true;
+    r.lang            = "de-DE";
+    r.maxAlternatives = 1;
+
+    r.onresult = (e) => {
+      let interim = "", final = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) final += t + " ";
+        else interim += t;
+      }
+      if (interim) onInterim?.(interim);
+      if (final)   onFinal?.(final);
+    };
+
+    r.onerror = (e) => {
+      if (e.error !== "no-speech" && e.error !== "aborted") {
+        console.warn("SpeechRecognition error:", e.error);
+      }
+    };
+
+    r.onend = () => {
+      if (activeRef.current) {
+        try { r.start(); } catch {}
+      }
+    };
+
+    recogRef.current = r;
+    try { r.start(); } catch {}
+  }, [onInterim, onFinal]);
+
+  const stop = useCallback(() => {
+    activeRef.current = false;
+    try { recogRef.current?.stop(); } catch {}
+    recogRef.current = null;
+  }, []);
+
+  return { start, stop };
+}
+
 // ── Circular SVG Timer ────────────────────────────────────────────────────────
 function CircularTimer({ timeLeft, totalTime, phase }) {
-  const radius       = 54;
+  const radius        = 54;
   const circumference = 2 * Math.PI * radius;
   const pct    = timeLeft / totalTime;
   const offset = circumference * (1 - pct);
@@ -89,64 +206,32 @@ function CircularTimer({ timeLeft, totalTime, phase }) {
             <stop offset="100%" stopColor="#12141d" />
           </radialGradient>
         </defs>
-        {/* Face */}
         <circle cx="64" cy="64" r="58" fill="url(#timerFace)" />
-        {/* Outer metallic ring */}
         <circle cx="64" cy="64" r="62" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="2" />
-        {/* Track */}
+        <circle cx="64" cy="64" r={radius} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="9" />
         <circle
           cx="64" cy="64" r={radius}
-          fill="none"
-          stroke="rgba(255,255,255,0.05)"
-          strokeWidth="9"
-        />
-        {/* Glow behind progress */}
-        <circle
-          cx="64" cy="64" r={radius}
-          fill="none"
-          stroke={glowColor}
-          strokeWidth="9"
-          strokeLinecap="round"
-          strokeDasharray={circumference}
-          strokeDashoffset={offset}
+          fill="none" stroke={glowColor} strokeWidth="9" strokeLinecap="round"
+          strokeDasharray={circumference} strokeDashoffset={offset}
           transform="rotate(-90 64 64)"
           style={{ filter: "blur(6px)", transition: "stroke-dashoffset 0.5s linear, stroke 0.4s ease" }}
         />
-        {/* Progress arc */}
         <circle
           cx="64" cy="64" r={radius}
-          fill="none"
-          stroke={progressColor}
-          strokeWidth="7"
-          strokeLinecap="round"
-          strokeDasharray={circumference}
-          strokeDashoffset={offset}
+          fill="none" stroke={progressColor} strokeWidth="7" strokeLinecap="round"
+          strokeDasharray={circumference} strokeDashoffset={offset}
           transform="rotate(-90 64 64)"
           style={{ transition: "stroke-dashoffset 0.5s linear, stroke 0.4s ease" }}
         />
-        {/* Time text */}
-        <text
-          x="64" y="58"
-          textAnchor="middle"
-          dominantBaseline="middle"
-          fill={isUrgent ? "#ff4d4d" : "#ffffff"}
-          fontSize="22"
-          fontWeight="700"
+        <text x="64" y="58" textAnchor="middle" dominantBaseline="middle"
+          fill={isUrgent ? "#ff4d4d" : "#ffffff"} fontSize="22" fontWeight="700"
           fontFamily="'Syne', 'Space Grotesk', sans-serif"
-          style={{ transition: "fill 0.4s ease" }}
-        >
+          style={{ transition: "fill 0.4s ease" }}>
           {mins}:{secs}
         </text>
-        <text
-          x="64" y="77"
-          textAnchor="middle"
-          dominantBaseline="middle"
-          fill="rgba(255,255,255,0.35)"
-          fontSize="8"
-          fontWeight="500"
-          fontFamily="'Syne', sans-serif"
-          letterSpacing="2"
-        >
+        <text x="64" y="77" textAnchor="middle" dominantBaseline="middle"
+          fill="rgba(255,255,255,0.35)" fontSize="8" fontWeight="500"
+          fontFamily="'Syne', sans-serif" letterSpacing="2">
           {phase === "prep" ? "VORBEREITUNG" : "SPRECHEN"}
         </text>
       </svg>
@@ -154,10 +239,125 @@ function CircularTimer({ timeLeft, totalTime, phase }) {
   );
 }
 
-// ── Redemittel Panel — Glassmorphism ─────────────────────────────────────────
+// ── Live Transcript Box ───────────────────────────────────────────────────────
+function LiveTranscriptBox({ transcript, interimText, partnerTranscript, isMulti }) {
+  const bottomRef = useRef(null);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [transcript, interimText]);
+
+  return (
+    <div className="cr-transcript-box">
+      <div className="cr-transcript-header">
+        <span className="cr-transcript-icon">🎙</span>
+        <span className="cr-transcript-label">Live Transkript</span>
+        {isMulti && <span className="cr-transcript-dot cr-transcript-dot-live" />}
+      </div>
+      <div className="cr-transcript-body">
+        {!transcript && !interimText && (
+          <span className="cr-transcript-placeholder">Fang an zu sprechen…</span>
+        )}
+        <span className="cr-transcript-final">{transcript}</span>
+        {interimText && <span className="cr-transcript-interim">{interimText}</span>}
+        <div ref={bottomRef} />
+      </div>
+      {isMulti && partnerTranscript && (
+        <div className="cr-transcript-partner">
+          <span className="cr-transcript-partner-label">Partner:</span>
+          <span className="cr-transcript-partner-text">{partnerTranscript}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── AI Feedback Card ──────────────────────────────────────────────────────────
+function AIFeedbackCard({ feedback, transcript, isLoading }) {
+  if (isLoading) {
+    return (
+      <div className="cr-feedback-card cr-feedback-loading">
+        <div className="cr-feedback-spinner">
+          <svg width="32" height="32" viewBox="0 0 32 32">
+            <circle cx="16" cy="16" r="12" fill="none" stroke="rgba(79,158,255,0.2)" strokeWidth="3" />
+            <circle cx="16" cy="16" r="12" fill="none" stroke="#4f9eff" strokeWidth="3"
+              strokeLinecap="round" strokeDasharray="40 36"
+              style={{ animation: "cr-spin 1s linear infinite", transformOrigin: "center" }} />
+          </svg>
+        </div>
+        <p className="cr-feedback-loading-text">KI analysiert deine Antwort…</p>
+      </div>
+    );
+  }
+
+  if (!feedback) return null;
+
+  const { score = 0, correctedText, feedback: feedbackText, errors = [] } = feedback;
+  const highlightedOriginal = highlightErrors(transcript, errors);
+  const stars = Array.from({ length: 5 }, (_, i) => i < score);
+
+  return (
+    <div className="cr-feedback-card">
+      {/* Header row */}
+      <div className="cr-feedback-header">
+        <div className="cr-feedback-title-row">
+          <span className="cr-feedback-icon">🤖</span>
+          <h3 className="cr-feedback-title">KI-Auswertung</h3>
+        </div>
+        <div className="cr-feedback-stars">
+          {stars.map((filled, i) => (
+            <span key={i} className={`cr-star${filled ? " cr-star-filled" : ""}`}>★</span>
+          ))}
+          <span className="cr-feedback-score-label">{score}/5</span>
+        </div>
+      </div>
+
+      {/* Original with errors */}
+      {transcript && (
+        <div className="cr-feedback-section">
+          <div className="cr-feedback-section-label">Dein Text</div>
+          <p
+            className="cr-feedback-original"
+            dangerouslySetInnerHTML={{ __html: highlightedOriginal }}
+          />
+        </div>
+      )}
+
+      {/* Corrected text */}
+      {correctedText && (
+        <div className="cr-feedback-section">
+          <div className="cr-feedback-section-label">Korrektur</div>
+          <p className="cr-feedback-corrected corrected-text">{correctedText}</p>
+        </div>
+      )}
+
+      {/* Error list */}
+      {errors.length > 0 && (
+        <div className="cr-feedback-section">
+          <div className="cr-feedback-section-label">Fehler</div>
+          <div className="cr-feedback-errors">
+            {errors.map((e, i) => (
+              <div key={i} className="cr-feedback-error-row">
+                <span className="error-text cr-feedback-error-orig">{e.original}</span>
+                <span className="cr-feedback-arrow">→</span>
+                <span className="corrected-text cr-feedback-error-fix">{e.correction}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Feedback text */}
+      {feedbackText && (
+        <div className="cr-feedback-section cr-feedback-section-last">
+          <div className="cr-feedback-section-label">Feedback</div>
+          <p className="cr-feedback-text">{feedbackText}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Redemittel Panel ──────────────────────────────────────────────────────────
 function RedemittelPanel({ items = [] }) {
   const [open, setOpen] = useState(false);
-
   const defaultItems = items.length > 0 ? items : [
     "Ich möchte zunächst darauf hinweisen, dass …",
     "Meiner Meinung nach ist es wichtig, …",
@@ -226,32 +426,88 @@ export default function ChallengeRoom({
   currentUser,
   questions   = [],
   onExit,
-  heroBgImage = "/1000188762.png",   // Pass the path to your uploaded image here
+  heroBgImage = "/1000188762.png",
 }) {
-  const me     = currentUser || { uid: "demo", displayName: "Du" };
-  const isSolo = mode === "solo";
+  const me      = currentUser || { uid: "demo", displayName: "Du" };
+  const isSolo  = mode === "solo";
   const isMulti = mode === "multi";
 
-  const [phase,          setPhase]          = useState("intro");
-  const [timerPhase,     setTimerPhase]     = useState("prep");
-  const [timeLeft,       setTimeLeft]       = useState(PREP_DURATION);
-  const [currentQ,       setCurrentQ]       = useState(null);
-  const [usedIds,        setUsedIds]        = useState([]);
-  const [round,          setRound]          = useState(1);
-  const [myRole,         setMyRole]         = useState("speaker");
-  const [partnerName,    setPartnerName]    = useState("Partner");
-  const [sessionHistory, setSessionHistory] = useState([]);
-  const [showExitConfirm,setShowExitConfirm]= useState(false);
-  const [userText,       setUserText]       = useState("");
-  const [scoreResult,    setScoreResult]    = useState(null);
-  const [room,           setRoom]           = useState(null);
-  const [fbLoading,      setFbLoading]      = useState(isMulti);
-  const [phaseAnim,      setPhaseAnim]      = useState("in");
+  const [phase,              setPhase]              = useState("intro");
+  const [timerPhase,         setTimerPhase]         = useState("prep");
+  const [timeLeft,           setTimeLeft]           = useState(PREP_DURATION);
+  const [currentQ,           setCurrentQ]           = useState(null);
+  const [usedIds,            setUsedIds]            = useState([]);
+  const [round,              setRound]              = useState(1);
+  const [myRole,             setMyRole]             = useState("speaker");
+  const [partnerName,        setPartnerName]        = useState("Partner");
+  const [sessionHistory,     setSessionHistory]     = useState([]);
+  const [showExitConfirm,    setShowExitConfirm]    = useState(false);
+  const [room,               setRoom]               = useState(null);
+  const [fbLoading,          setFbLoading]          = useState(isMulti);
+  const [phaseAnim,          setPhaseAnim]          = useState("in");
 
-  const timerRef     = useRef(null);
-  const startedAtRef = useRef(null);
+  // Transcript state
+  const [transcript,         setTranscript]         = useState("");
+  const [interimText,        setInterimText]        = useState("");
+  const [partnerTranscript,  setPartnerTranscript]  = useState("");
+  const [isRecording,        setIsRecording]        = useState(false);
 
-  useEffect(() => () => clearInterval(timerRef.current), []);
+  // AI state
+  const [aiFeedback,         setAiFeedback]         = useState(null);
+  const [partnerAiFeedback,  setPartnerAiFeedback]  = useState(null);
+  const [aiFeedbackLoading,  setAiFeedbackLoading]  = useState(false);
+
+  const timerRef      = useRef(null);
+  const startedAtRef  = useRef(null);
+  const transcriptRef = useRef("");
+
+  // Keep transcriptRef in sync
+  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
+
+  useEffect(() => () => {
+    clearInterval(timerRef.current);
+  }, []);
+
+  // ── Speech recognition callbacks ───────────────────────────────────────────
+  const handleInterim = useCallback((text) => {
+    setInterimText(text);
+  }, []);
+
+  const handleFinal = useCallback((text) => {
+    setTranscript(prev => {
+      const updated = (prev + " " + text).trim();
+      transcriptRef.current = updated;
+      // Sync to Firebase
+      if (isMulti && roomId) {
+        getFirebaseDB().then(db => {
+          if (!db) return;
+          import("firebase/database").then(({ ref, set }) => {
+            set(ref(db, `rooms/${roomId}/transcripts/${me.uid}`), updated);
+          });
+        });
+      }
+      return updated;
+    });
+    setInterimText("");
+  }, [isMulti, roomId, me.uid]);
+
+  const isSpeaking = phase === "speaking" && myRole === "speaker";
+  const { start: startRecog, stop: stopRecog } = useSpeechRecognition({
+    onInterim: handleInterim,
+    onFinal: handleFinal,
+    active: isSpeaking && isRecording,
+  });
+
+  // Start/stop recognition when speaking phase and role match
+  useEffect(() => {
+    if (isSpeaking && isRecording) {
+      startRecog();
+    } else {
+      stopRecog();
+      setInterimText("");
+    }
+    return () => stopRecog();
+  }, [isSpeaking, isRecording]);
 
   function transitionPhase(newPhase) {
     setPhaseAnim("out");
@@ -300,12 +556,23 @@ export default function ChallengeRoom({
           const q = questions.find(q => q.id === data.currentQuestionId);
           if (q) setCurrentQ(q);
         }
-        if (data.status)                                              setPhase(data.status);
+        if (data.status) setPhase(data.status);
         if (data.timer?.startedAt && data.timer?.state === "running") {
           const elapsed = Math.floor((Date.now() - data.timer.startedAt) / 1000);
           const left    = Math.max(0, data.timer.durationSec - elapsed);
           setTimerPhase(data.timer.phase || "prep");
           setTimeLeft(left);
+        }
+        // Sync partner transcript
+        if (data.transcripts && partner?.uid) {
+          setPartnerTranscript(data.transcripts[partner.uid] || "");
+        }
+        // Sync AI feedback for both users
+        if (data.aiFeedback) {
+          const myFb      = data.aiFeedback[me.uid];
+          const partnerFb = data.aiFeedback[partner?.uid];
+          if (myFb)      setAiFeedback(myFb);
+          if (partnerFb) setPartnerAiFeedback(partnerFb);
         }
       });
       cleanup = () => off(roomRef);
@@ -322,6 +589,9 @@ export default function ChallengeRoom({
   }
 
   function beginPrep(questionOverride) {
+    setTranscript("");
+    setInterimText("");
+    setAiFeedback(null);
     const q = questionOverride || pickRandom(questions, usedIds);
     setCurrentQ(q);
     setUsedIds(prev => [...prev, q.id]);
@@ -344,6 +614,7 @@ export default function ChallengeRoom({
     clearInterval(timerRef.current);
     setTimerPhase("speak");
     setTimeLeft(SPEAK_DURATION);
+    setIsRecording(true);
     playBeep({ freq: 660, gain: 0.4 });
     transitionPhase("speaking");
     startLocalTimer(SPEAK_DURATION, handleSpeakEnd);
@@ -353,13 +624,35 @@ export default function ChallengeRoom({
     }
   }
 
-  function handleSpeakEnd() {
+  async function handleSpeakEnd() {
     clearInterval(timerRef.current);
+    setIsRecording(false);
+    stopRecog();
     playBeep({ freq: 440, gain: 0.3 });
-    if (isSolo)     { transitionPhase("selfAssess"); return; }
-    if (round >= 2) { transitionPhase("finished");   return; }
-    transitionPhase("switching");
-    fbSet(`rooms/${roomId}/status`, "switching");
+
+    const finalTranscript = transcriptRef.current;
+
+    // Show loading state
+    setAiFeedbackLoading(true);
+    transitionPhase("selfAssess");
+
+    // Fetch AI feedback
+    try {
+      const result = await fetchAIFeedback(finalTranscript);
+      setAiFeedback(result);
+
+      // Sync to Firebase for both users to see
+      if (isMulti && roomId && result) {
+        fbSet(`rooms/${roomId}/aiFeedback/${me.uid}`, {
+          ...result,
+          transcript: finalTranscript,
+        });
+      }
+    } catch (err) {
+      console.error("AI feedback error:", err);
+    } finally {
+      setAiFeedbackLoading(false);
+    }
   }
 
   const totalTime = timerPhase === "prep" ? PREP_DURATION : SPEAK_DURATION;
@@ -372,7 +665,6 @@ export default function ChallengeRoom({
       <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet" />
 
       <div className="cr-root">
-        {/* Persistent bg for non-intro phases */}
         <div className="cr-bg-dim" />
 
         {showExitConfirm && (
@@ -382,19 +674,13 @@ export default function ChallengeRoom({
           />
         )}
 
-        {/* ── INTRO / LANDING ──────────────────────────────────────────────── */}
+        {/* ── INTRO ────────────────────────────────────────────────────────── */}
         {phase === "intro" && (
           <div className="cr-intro-stage">
-            {/* Hero background with slow-zoom */}
-            <div
-              className="cr-hero-bg"
-              style={{ backgroundImage: `url(${heroBgImage})` }}
-            />
-            {/* Gradient overlays */}
+            <div className="cr-hero-bg" style={{ backgroundImage: `url(${heroBgImage})` }} />
             <div className="cr-hero-overlay-top" />
             <div className="cr-hero-overlay-bottom" />
 
-            {/* Header bar */}
             <header className="cr-header cr-header-hero">
               <div className="cr-logo">
                 <span className="cr-logo-b2">B2</span>
@@ -416,7 +702,6 @@ export default function ChallengeRoom({
               </button>
             </header>
 
-            {/* Hero content */}
             <div className="cr-hero-content">
               <div className="cr-hero-eyebrow">Deutschprüfung B2 · Mündliche Kommunikation</div>
               <h1 className="cr-hero-title">
@@ -425,27 +710,18 @@ export default function ChallengeRoom({
               </h1>
               <p className="cr-hero-sub">
                 {isSolo
-                  ? "Solo-Übung · 30 s Vorbereitung · 3 min Sprechen"
-                  : `Duell mit ${partnerName} · 2 Runden · Rollenwechsel`}
+                  ? "Solo-Übung · 30 s Vorbereitung · 3 min Sprechen · KI-Feedback"
+                  : `Duell mit ${partnerName} · 2 Runden · Live-Transkript · KI-Auswertung`}
               </p>
-
               <div className="cr-hero-meta-row">
-                <div className="cr-hero-meta-item">
-                  <span className="cr-hero-meta-icon">⏱</span>
-                  <span>30 s Vorbereitung</span>
-                </div>
+                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">⏱</span><span>30 s Vorbereitung</span></div>
                 <div className="cr-hero-meta-divider" />
-                <div className="cr-hero-meta-item">
-                  <span className="cr-hero-meta-icon">🎙</span>
-                  <span>3 min Sprechen</span>
-                </div>
+                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">🎙</span><span>3 min Sprechen</span></div>
                 <div className="cr-hero-meta-divider" />
-                <div className="cr-hero-meta-item">
-                  <span className="cr-hero-meta-icon">📋</span>
-                  <span>Redemittel inklusive</span>
-                </div>
+                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">🤖</span><span>KI-Auswertung</span></div>
+                <div className="cr-hero-meta-divider" />
+                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">📋</span><span>Redemittel</span></div>
               </div>
-
               <button className="cr-hero-start-btn" onClick={() => beginPrep()}>
                 <span>Übung starten</span>
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
@@ -472,6 +748,12 @@ export default function ChallengeRoom({
                   </span>
                 )}
                 <span className="cr-round-badge">Runde {round} / 2</span>
+                {isRecording && (
+                  <span className="cr-recording-badge">
+                    <span className="cr-recording-dot" />
+                    REC
+                  </span>
+                )}
               </div>
               <button className="cr-exit-btn" onClick={handleExitRequest} aria-label="Beenden">
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
@@ -485,67 +767,114 @@ export default function ChallengeRoom({
               {/* PREP / SPEAKING */}
               {(phase === "prep" || phase === "speaking") && currentQ && (
                 <div className="cr-game-layout">
-                  {/* Timer column */}
                   <div className="cr-timer-col">
                     <CircularTimer timeLeft={timeLeft} totalTime={totalTime} phase={timerPhase} />
-
                     <div className={`cr-phase-pill cr-phase-pill-${timerPhase}`}>
                       {timerPhase === "prep" ? "Vorbereitung" : "Sprechen"}
                     </div>
-
                     {phase === "prep" && (
                       <button className="cr-skip-btn" onClick={() => beginSpeaking(currentQ)}>
                         Jetzt sprechen →
                       </button>
                     )}
-
-                    {/* Role indicator for multiplayer */}
                     {isMulti && (
                       <div className="cr-role-badge">
                         {myRole === "speaker" ? "🎙 Sprecher" : "👂 Zuhörer"}
                       </div>
                     )}
+                    {phase === "speaking" && myRole === "speaker" && (
+                      <button
+                        className={`cr-mic-toggle${isRecording ? " cr-mic-active" : ""}`}
+                        onClick={() => setIsRecording(r => !r)}
+                        title={isRecording ? "Mikrofon stummschalten" : "Mikrofon aktivieren"}
+                      >
+                        {isRecording ? (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                            <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" fill="currentColor"/>
+                            <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                          </svg>
+                        ) : (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                            <line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                            <path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2a7 7 0 01-.11 1.23M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                          </svg>
+                        )}
+                        <span>{isRecording ? "Aktiv" : "Stumm"}</span>
+                      </button>
+                    )}
                   </div>
 
-                  {/* Question + Redemittel column */}
                   <div className="cr-card-col">
                     <div className="cr-topic-chip">{currentQ.topic || "Thema"}</div>
-
                     <div className="cr-question-card">
                       <div className="cr-question-number">Aufgabe</div>
                       <p className="cr-question-text">{currentQ.question}</p>
                     </div>
-
                     <RedemittelPanel items={currentQ.redemittel} />
+
+                    {/* Live transcript (only during speaking for speaker; always for listener in multi) */}
+                    {phase === "speaking" && (myRole === "speaker" || isMulti) && (
+                      <LiveTranscriptBox
+                        transcript={myRole === "speaker" ? transcript : partnerTranscript}
+                        interimText={myRole === "speaker" ? interimText : ""}
+                        partnerTranscript={myRole === "speaker" ? partnerTranscript : transcript}
+                        isMulti={isMulti}
+                      />
+                    )}
                   </div>
                 </div>
               )}
 
-              {/* SELF ASSESS */}
+              {/* SELF ASSESS / AI FEEDBACK */}
               {phase === "selfAssess" && currentQ && (
                 <div className="cr-center-stage">
-                  <div className="cr-assess-card">
-                    <div className="cr-assess-icon">✍️</div>
-                    <h2 className="cr-assess-heading">Selbstbewertung</h2>
-                    <p className="cr-assess-sub">Wie lief deine Antwort? Schreib sie hier auf (optional).</p>
-                    <textarea
-                      className="cr-assess-textarea"
-                      placeholder="Deine Antwort auf Deutsch …"
-                      value={userText}
-                      onChange={e => setUserText(e.target.value)}
-                      rows={5}
+                  <div className="cr-assess-wide">
+                    <div className="cr-assess-header">
+                      <div className="cr-assess-icon">✍️</div>
+                      <h2 className="cr-assess-heading">Auswertung</h2>
+                      <p className="cr-assess-sub">Deine KI-gestützte Sprachanalyse</p>
+                    </div>
+
+                    {/* AI Feedback */}
+                    <AIFeedbackCard
+                      feedback={aiFeedback}
+                      transcript={transcript}
+                      isLoading={aiFeedbackLoading}
                     />
-                    <button
-                      className="cr-primary-btn"
-                      onClick={() => {
-                        const result = scoreAnswer(userText, currentQ.redemittel || []);
-                        setScoreResult(result);
-                        setSessionHistory(h => [...h, { q: currentQ, result }]);
-                        transitionPhase("finished");
-                      }}
-                    >
-                      Weiter zur Auswertung →
-                    </button>
+
+                    {/* Partner feedback in multi */}
+                    {isMulti && partnerAiFeedback && (
+                      <div className="cr-partner-feedback-wrap">
+                        <div className="cr-partner-feedback-label">🤝 {partnerName}s Auswertung</div>
+                        <AIFeedbackCard
+                          feedback={partnerAiFeedback}
+                          transcript={partnerAiFeedback.transcript}
+                          isLoading={false}
+                        />
+                      </div>
+                    )}
+
+                    {/* Manual textarea for additional notes */}
+                    <div className="cr-assess-card cr-assess-card-notes">
+                      <p className="cr-assess-notes-label">Eigene Notizen (optional)</p>
+                      <textarea
+                        className="cr-assess-textarea"
+                        placeholder="Notizen auf Deutsch …"
+                        rows={3}
+                      />
+                      <button
+                        className="cr-primary-btn"
+                        style={{ marginTop: 8, alignSelf: "flex-end" }}
+                        onClick={() => {
+                          const result = scoreAnswer(transcript, currentQ.redemittel || []);
+                          setSessionHistory(h => [...h, { q: currentQ, result, aiFeedback }]);
+                          if (isSolo || round >= 2) { transitionPhase("finished"); }
+                          else                       { transitionPhase("switching"); }
+                        }}
+                      >
+                        {isSolo || round >= 2 ? "Zur Abschlussbewertung →" : "Nächste Runde →"}
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -578,46 +907,64 @@ export default function ChallengeRoom({
               {/* FINISHED */}
               {phase === "finished" && (
                 <div className="cr-center-stage">
-                  <div className="cr-finish-card">
-                    <div className="cr-finish-confetti">🏆</div>
-                    <h1 className="cr-finish-title">Geschafft!</h1>
-                    <p className="cr-finish-sub">Hervorragende Arbeit!</p>
+                  <div className="cr-finish-wide">
+                    <div className="cr-finish-card">
+                      <div className="cr-finish-confetti">🏆</div>
+                      <h1 className="cr-finish-title">Geschafft!</h1>
+                      <p className="cr-finish-sub">Hervorragende Arbeit!</p>
 
-                    {scoreResult && (
-                      <div className="cr-score-ring">
-                        <svg viewBox="0 0 120 120" width="140" height="140">
-                          <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(79,158,255,0.1)" strokeWidth="10" />
-                          <circle cx="60" cy="60" r="52" fill="none"
-                            stroke="#4f9eff" strokeWidth="10" strokeLinecap="round"
-                            strokeDasharray={`${2 * Math.PI * 52}`}
-                            strokeDashoffset={`${2 * Math.PI * 52 * (1 - scoreResult.score / 10)}`}
-                            transform="rotate(-90 60 60)"
-                            style={{ transition: "stroke-dashoffset 1s ease" }}
-                          />
-                          <text x="60" y="56" textAnchor="middle" dominantBaseline="middle"
-                            fill="#fff" fontSize="28" fontWeight="700" fontFamily="Syne, sans-serif">
-                            {scoreResult.score}
-                          </text>
-                          <text x="60" y="76" textAnchor="middle" dominantBaseline="middle"
-                            fill="rgba(255,255,255,0.4)" fontSize="10" fontFamily="Syne, sans-serif">
-                            VON 10
-                          </text>
-                        </svg>
-
-                        {scoreResult.matched.length > 0 && (
-                          <div className="cr-score-matched">
-                            <span className="cr-score-matched-label">✓ Verwendet:</span>
-                            {scoreResult.matched.slice(0, 3).map((m, i) => (
-                              <span key={i} className="cr-score-tag">{m.split(" ").slice(0, 3).join(" ")}…</span>
-                            ))}
+                      {/* Final AI feedback summary */}
+                      {aiFeedback && (
+                        <div className="cr-finish-summary">
+                          <div className="cr-finish-score-wrap">
+                            <svg viewBox="0 0 120 120" width="130" height="130">
+                              <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(79,158,255,0.1)" strokeWidth="10" />
+                              <circle cx="60" cy="60" r="52" fill="none"
+                                stroke="#4f9eff" strokeWidth="10" strokeLinecap="round"
+                                strokeDasharray={`${2 * Math.PI * 52}`}
+                                strokeDashoffset={`${2 * Math.PI * 52 * (1 - (aiFeedback.score || 0) / 5)}`}
+                                transform="rotate(-90 60 60)"
+                                style={{ transition: "stroke-dashoffset 1s ease" }}
+                              />
+                              <text x="60" y="56" textAnchor="middle" dominantBaseline="middle"
+                                fill="#fff" fontSize="28" fontWeight="700" fontFamily="Syne, sans-serif">
+                                {aiFeedback.score}
+                              </text>
+                              <text x="60" y="76" textAnchor="middle" dominantBaseline="middle"
+                                fill="rgba(255,255,255,0.4)" fontSize="10" fontFamily="Syne, sans-serif">
+                                VON 5
+                              </text>
+                            </svg>
                           </div>
-                        )}
+                          {aiFeedback.feedback && (
+                            <p className="cr-finish-feedback-text">{aiFeedback.feedback}</p>
+                          )}
+                        </div>
+                      )}
+
+                      <button className="cr-primary-btn cr-finish-btn" onClick={() => onExit?.()}>
+                        Beenden
+                      </button>
+                    </div>
+
+                    {/* Full feedback replay */}
+                    {aiFeedback && (
+                      <AIFeedbackCard
+                        feedback={aiFeedback}
+                        transcript={transcript}
+                        isLoading={false}
+                      />
+                    )}
+                    {isMulti && partnerAiFeedback && (
+                      <div className="cr-partner-feedback-wrap">
+                        <div className="cr-partner-feedback-label">🤝 {partnerName}s Auswertung</div>
+                        <AIFeedbackCard
+                          feedback={partnerAiFeedback}
+                          transcript={partnerAiFeedback.transcript}
+                          isLoading={false}
+                        />
                       </div>
                     )}
-
-                    <button className="cr-primary-btn cr-finish-btn" onClick={() => onExit?.()}>
-                      Beenden
-                    </button>
                   </div>
                 </div>
               )}
@@ -633,7 +980,6 @@ export default function ChallengeRoom({
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap');
 
-  /* ── Root & tokens ──────────────────────────────────────────────────────── */
   .cr-root {
     --bg:            #0e1018;
     --surface:       #161925;
@@ -649,8 +995,10 @@ const CSS = `
     --accent-dim:    rgba(79,158,255,0.15);
     --accent-glow:   rgba(79,158,255,0.3);
     --red:           #ff4d4d;
+    --red-dim:       rgba(255,77,77,0.12);
     --amber:         #f59e0b;
     --green:         #34d399;
+    --green-dim:     rgba(52,211,153,0.12);
     --radius:        18px;
     --radius-sm:     12px;
     --font-display:  'Syne', system-ui, sans-serif;
@@ -667,837 +1015,380 @@ const CSS = `
   }
 
   .cr-bg-dim {
-    position: fixed;
-    inset: 0;
+    position: fixed; inset: 0;
     background:
       radial-gradient(ellipse 80% 60% at 20% 10%, rgba(30,40,80,0.4) 0%, transparent 70%),
       radial-gradient(ellipse 60% 50% at 80% 90%, rgba(10,20,50,0.5) 0%, transparent 70%);
-    pointer-events: none;
-    z-index: 0;
+    pointer-events: none; z-index: 0;
   }
 
-  /* ── Slow-Zoom keyframes for hero bg ────────────────────────────────────── */
   @keyframes cr-slow-zoom {
     0%   { transform: scale(1.0); }
     100% { transform: scale(1.12); }
   }
-
   @keyframes cr-fade-up {
     from { opacity: 0; transform: translateY(24px); }
     to   { opacity: 1; transform: translateY(0); }
   }
-
   @keyframes timerPulse {
     0%, 100% { transform: scale(1); }
     50%       { transform: scale(1.05); }
   }
-
   @keyframes modalIn {
     from { opacity: 0; transform: scale(0.94) translateY(10px); }
     to   { opacity: 1; transform: scale(1)    translateY(0); }
   }
-
   @keyframes cr-glow-pulse {
     0%, 100% { box-shadow: 0 0 24px rgba(79,158,255,0.2); }
     50%       { box-shadow: 0 0 40px rgba(79,158,255,0.45); }
   }
+  @keyframes cr-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+  @keyframes cr-blink {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+  @keyframes cr-waveform {
+    0%, 100% { transform: scaleY(0.4); }
+    50%       { transform: scaleY(1); }
+  }
 
-  /* ── Hero / Intro stage ─────────────────────────────────────────────────── */
+  /* ── Hero ────────────────────────────────────────────────────────────────── */
   .cr-intro-stage {
-    position: relative;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+    position: relative; min-height: 100vh;
+    display: flex; flex-direction: column; overflow: hidden;
   }
-
   .cr-hero-bg {
-    position: absolute;
-    inset: -8%;          /* Extra room for zoom without edges showing */
-    background-size: cover;
-    background-position: center;
-    background-repeat: no-repeat;
+    position: absolute; inset: -8%;
+    background-size: cover; background-position: center; background-repeat: no-repeat;
     animation: cr-slow-zoom 18s ease-in-out infinite alternate;
-    will-change: transform;
-    z-index: 0;
+    will-change: transform; z-index: 0;
   }
-
-  /* Top header gradient */
   .cr-hero-overlay-top {
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 220px;
+    position: absolute; top: 0; left: 0; right: 0; height: 220px;
     background: linear-gradient(to bottom, rgba(10,12,22,0.92) 0%, transparent 100%);
-    z-index: 1;
-    pointer-events: none;
+    z-index: 1; pointer-events: none;
   }
-
-  /* Bottom content gradient */
   .cr-hero-overlay-bottom {
-    position: absolute;
-    bottom: 0; left: 0; right: 0;
-    height: 75%;
-    background: linear-gradient(
-      to top,
-      rgba(8,10,20,0.98)  0%,
-      rgba(8,10,20,0.90)  30%,
-      rgba(8,10,20,0.60)  60%,
-      transparent         100%
-    );
-    z-index: 1;
-    pointer-events: none;
+    position: absolute; bottom: 0; left: 0; right: 0; height: 75%;
+    background: linear-gradient(to top, rgba(8,10,20,0.98) 0%, rgba(8,10,20,0.90) 30%, rgba(8,10,20,0.60) 60%, transparent 100%);
+    z-index: 1; pointer-events: none;
   }
-
   .cr-header-hero {
-    position: relative;
-    z-index: 10;
+    position: relative; z-index: 10;
     background: transparent !important;
     border-bottom: 1px solid rgba(255,255,255,0.06) !important;
   }
-
   .cr-hero-content {
-    position: relative;
-    z-index: 5;
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    justify-content: flex-end;
-    padding: 0 56px 64px;
-    max-width: 800px;
-    animation: cr-fade-up 0.8s ease both;
-    animation-delay: 0.15s;
+    position: relative; z-index: 5; flex: 1;
+    display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-end;
+    padding: 0 56px 64px; max-width: 800px;
+    animation: cr-fade-up 0.8s ease both; animation-delay: 0.15s;
   }
-
   .cr-hero-eyebrow {
-    font-family: var(--font-display);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-    color: var(--accent);
-    margin-bottom: 18px;
-    opacity: 0.9;
+    font-family: var(--font-display); font-size: 11px; font-weight: 600;
+    letter-spacing: 3px; text-transform: uppercase; color: var(--accent);
+    margin-bottom: 18px; opacity: 0.9;
   }
-
   .cr-hero-title {
-    font-family: var(--font-display);
-    font-size: clamp(44px, 7vw, 80px);
-    font-weight: 800;
-    line-height: 1.05;
-    letter-spacing: -2px;
-    color: #fff;
-    margin: 0 0 20px;
+    font-family: var(--font-display); font-size: clamp(44px, 7vw, 80px);
+    font-weight: 800; line-height: 1.05; letter-spacing: -2px; color: #fff; margin: 0 0 20px;
   }
-
   .cr-hero-title-accent {
     background: linear-gradient(120deg, #4f9eff 0%, #a78bfa 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
   }
-
-  .cr-hero-sub {
-    font-family: var(--font-body);
-    font-size: 16px;
-    color: rgba(255,255,255,0.55);
-    margin-bottom: 32px;
-    line-height: 1.6;
-  }
-
-  .cr-hero-meta-row {
-    display: flex;
-    align-items: center;
-    gap: 0;
-    margin-bottom: 40px;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .cr-hero-meta-item {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 13px;
-    color: rgba(255,255,255,0.5);
-    font-family: var(--font-body);
-  }
+  .cr-hero-sub { font-family: var(--font-body); font-size: 16px; color: rgba(255,255,255,0.55); margin-bottom: 32px; line-height: 1.6; }
+  .cr-hero-meta-row { display: flex; align-items: center; margin-bottom: 40px; flex-wrap: wrap; gap: 8px; }
+  .cr-hero-meta-item { display: flex; align-items: center; gap: 7px; font-size: 13px; color: rgba(255,255,255,0.5); font-family: var(--font-body); }
   .cr-hero-meta-icon { font-size: 14px; }
-  .cr-hero-meta-divider {
-    width: 1px;
-    height: 14px;
-    background: rgba(255,255,255,0.18);
-    margin: 0 12px;
-  }
-
+  .cr-hero-meta-divider { width: 1px; height: 14px; background: rgba(255,255,255,0.18); margin: 0 12px; }
   .cr-hero-start-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 12px;
+    display: inline-flex; align-items: center; gap: 12px;
     background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
-    color: #fff;
-    border: none;
-    padding: 16px 36px;
-    border-radius: 100px;
-    font-family: var(--font-display);
-    font-size: 16px;
-    font-weight: 700;
-    letter-spacing: 0.3px;
+    color: #fff; border: none; padding: 16px 36px; border-radius: 100px;
+    font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: 0.3px;
     cursor: pointer;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.1) inset,
-      0 12px 32px rgba(79,100,255,0.45),
-      0 2px 8px rgba(0,0,0,0.4);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.1) inset, 0 12px 32px rgba(79,100,255,0.45), 0 2px 8px rgba(0,0,0,0.4);
     transition: transform 0.18s, box-shadow 0.18s;
     animation: cr-glow-pulse 3s ease-in-out infinite;
   }
   .cr-hero-start-btn:hover {
     transform: translateY(-3px);
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.15) inset,
-      0 18px 44px rgba(79,100,255,0.55),
-      0 4px 12px rgba(0,0,0,0.5);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.15) inset, 0 18px 44px rgba(79,100,255,0.55), 0 4px 12px rgba(0,0,0,0.5);
   }
-  .cr-hero-start-btn:active { transform: translateY(0); }
-
   @media (max-width: 640px) {
     .cr-hero-content { padding: 0 24px 48px; }
     .cr-hero-title   { font-size: 40px; letter-spacing: -1px; }
   }
 
-  /* ── Header (non-hero) ──────────────────────────────────────────────────── */
+  /* ── Header ──────────────────────────────────────────────────────────────── */
   .cr-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 18px 28px;
-    border-bottom: 1px solid var(--border);
-    position: relative;
-    z-index: 10;
-    background: rgba(14,16,24,0.88);
-    backdrop-filter: blur(16px);
-    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 28px; border-bottom: 1px solid var(--border);
+    position: relative; z-index: 10;
+    background: rgba(14,16,24,0.88); backdrop-filter: blur(16px); flex-shrink: 0;
   }
-
-  .cr-logo {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-  }
-  .cr-logo-b2 {
-    font-family: var(--font-display);
-    font-weight: 800;
-    font-size: 22px;
-    color: var(--accent);
-    letter-spacing: -0.5px;
-  }
-  .cr-logo-beruf {
-    font-family: var(--font-display);
-    font-weight: 600;
-    font-size: 12px;
-    color: var(--text-muted);
-    letter-spacing: 2.5px;
-    text-transform: uppercase;
-  }
-
-  .cr-header-meta {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
+  .cr-logo { display: flex; align-items: baseline; gap: 6px; }
+  .cr-logo-b2 { font-family: var(--font-display); font-weight: 800; font-size: 22px; color: var(--accent); letter-spacing: -0.5px; }
+  .cr-logo-beruf { font-family: var(--font-display); font-weight: 600; font-size: 12px; color: var(--text-muted); letter-spacing: 2.5px; text-transform: uppercase; }
+  .cr-header-meta { display: flex; align-items: center; gap: 10px; }
   .cr-round-badge {
-    background: var(--surface2);
-    border: 1px solid var(--border-bright);
-    color: var(--text-muted);
-    font-family: var(--font-display);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    padding: 5px 14px;
-    border-radius: 100px;
+    background: var(--surface2); border: 1px solid var(--border-bright); color: var(--text-muted);
+    font-family: var(--font-display); font-size: 11px; font-weight: 600;
+    letter-spacing: 0.5px; padding: 5px 14px; border-radius: 100px;
   }
-  .cr-partner-badge {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--text-muted);
-    font-family: var(--font-body);
+  .cr-partner-badge { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); font-family: var(--font-body); }
+  .cr-partner-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 7px var(--green); }
+
+  /* Recording badge */
+  .cr-recording-badge {
+    display: flex; align-items: center; gap: 5px;
+    background: rgba(255,77,77,0.1); border: 1px solid rgba(255,77,77,0.3);
+    color: var(--red); font-family: var(--font-display); font-size: 10px; font-weight: 700;
+    letter-spacing: 1.5px; padding: 4px 10px; border-radius: 100px;
   }
-  .cr-partner-dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    background: var(--green);
-    box-shadow: 0 0 7px var(--green);
+  .cr-recording-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--red);
+    animation: cr-blink 1s ease-in-out infinite;
   }
 
   .cr-exit-btn {
-    background: var(--surface2);
-    border: 1px solid var(--border-bright);
-    color: var(--text-muted);
-    cursor: pointer;
-    width: 36px; height: 36px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    flex-shrink: 0;
+    background: var(--surface2); border: 1px solid var(--border-bright); color: var(--text-muted);
+    cursor: pointer; width: 36px; height: 36px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; transition: all 0.2s; flex-shrink: 0;
   }
-  .cr-exit-btn:hover {
-    background: var(--surface3);
-    color: var(--text);
-    border-color: rgba(255,255,255,0.22);
-  }
+  .cr-exit-btn:hover { background: var(--surface3); color: var(--text); border-color: rgba(255,255,255,0.22); }
 
-  /* ── Phase transitions ──────────────────────────────────────────────────── */
-  .cr-main {
-    position: relative;
-    z-index: 1;
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    transition: opacity 0.24s ease, transform 0.24s ease;
-  }
+  /* ── Phase transitions ───────────────────────────────────────────────────── */
+  .cr-main { position: relative; z-index: 1; flex: 1; display: flex; flex-direction: column; transition: opacity 0.24s ease, transform 0.24s ease; }
   .cr-phase-in  { opacity: 1; transform: translateY(0); }
   .cr-phase-out { opacity: 0; transform: translateY(12px); }
 
-  /* ── Center stage wrapper ───────────────────────────────────────────────── */
-  .cr-center-stage {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex: 1;
-    padding: 40px 24px;
-    min-height: 70vh;
-  }
+  /* ── Center stage ────────────────────────────────────────────────────────── */
+  .cr-center-stage { display: flex; align-items: flex-start; justify-content: center; flex: 1; padding: 40px 24px; min-height: 70vh; }
 
-  /* ── Game layout ────────────────────────────────────────────────────────── */
+  /* ── Game layout ─────────────────────────────────────────────────────────── */
   .cr-game-layout {
-    display: grid;
-    grid-template-columns: 180px 1fr;
-    gap: 36px;
-    padding: 40px 48px;
-    align-items: start;
-    max-width: 980px;
-    margin: 0 auto;
-    width: 100%;
-    box-sizing: border-box;
+    display: grid; grid-template-columns: 180px 1fr; gap: 36px;
+    padding: 40px 48px; align-items: start; max-width: 1020px; margin: 0 auto; width: 100%; box-sizing: border-box;
   }
   @media (max-width: 740px) {
-    .cr-game-layout {
-      grid-template-columns: 1fr;
-      padding: 24px 20px;
-      gap: 24px;
-    }
+    .cr-game-layout { grid-template-columns: 1fr; padding: 24px 20px; gap: 24px; }
   }
 
-  /* ── Timer column ───────────────────────────────────────────────────────── */
-  .cr-timer-col {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 14px;
-    position: sticky;
-    top: 28px;
-  }
-  .cr-timer-wrap {
-    position: relative;
-    filter: drop-shadow(0 0 20px rgba(79,158,255,0.15));
-  }
-  .cr-timer-urgent {
-    animation: timerPulse 0.7s ease-in-out infinite;
-  }
-
-  .cr-phase-pill {
-    font-family: var(--font-display);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    padding: 5px 16px;
-    border-radius: 100px;
-  }
-  .cr-phase-pill-prep {
-    background: rgba(245,158,11,0.1);
-    color: var(--amber);
-    border: 1px solid rgba(245,158,11,0.25);
-  }
-  .cr-phase-pill-speak {
-    background: var(--accent-dim);
-    color: var(--accent);
-    border: 1px solid var(--border-accent);
-  }
-
+  /* ── Timer col ───────────────────────────────────────────────────────────── */
+  .cr-timer-col { display: flex; flex-direction: column; align-items: center; gap: 14px; position: sticky; top: 28px; }
+  .cr-timer-wrap { position: relative; filter: drop-shadow(0 0 20px rgba(79,158,255,0.15)); }
+  .cr-timer-urgent { animation: timerPulse 0.7s ease-in-out infinite; }
+  .cr-phase-pill { font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; padding: 5px 16px; border-radius: 100px; }
+  .cr-phase-pill-prep { background: rgba(245,158,11,0.1); color: var(--amber); border: 1px solid rgba(245,158,11,0.25); }
+  .cr-phase-pill-speak { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--border-accent); }
   .cr-skip-btn {
-    background: none;
-    border: 1px solid var(--border-bright);
-    color: var(--text-muted);
-    font-family: var(--font-body);
-    font-size: 12px;
-    padding: 7px 16px;
-    border-radius: 100px;
-    cursor: pointer;
-    transition: all 0.2s;
+    background: none; border: 1px solid var(--border-bright); color: var(--text-muted);
+    font-family: var(--font-body); font-size: 12px; padding: 7px 16px; border-radius: 100px;
+    cursor: pointer; transition: all 0.2s;
   }
-  .cr-skip-btn:hover {
-    background: var(--surface2);
-    color: var(--text);
-    border-color: rgba(255,255,255,0.2);
-  }
+  .cr-skip-btn:hover { background: var(--surface2); color: var(--text); border-color: rgba(255,255,255,0.2); }
+  .cr-role-badge { background: var(--surface2); border: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-family: var(--font-body); padding: 5px 12px; border-radius: 100px; }
 
-  .cr-role-badge {
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    color: var(--text-muted);
-    font-size: 11px;
-    font-family: var(--font-body);
-    padding: 5px 12px;
-    border-radius: 100px;
+  /* Mic toggle */
+  .cr-mic-toggle {
+    display: flex; align-items: center; gap: 6px;
+    background: var(--surface2); border: 1px solid var(--border-bright);
+    color: var(--text-muted); font-family: var(--font-body); font-size: 11px;
+    padding: 7px 14px; border-radius: 100px; cursor: pointer; transition: all 0.2s;
   }
-
-  /* ── Card column ────────────────────────────────────────────────────────── */
-  .cr-card-col {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
+  .cr-mic-toggle:hover { background: var(--surface3); color: var(--text); }
+  .cr-mic-active {
+    background: rgba(255,77,77,0.12); border-color: rgba(255,77,77,0.3);
+    color: var(--red);
   }
+  .cr-mic-active:hover { background: rgba(255,77,77,0.2); }
 
+  /* ── Card col ────────────────────────────────────────────────────────────── */
+  .cr-card-col { display: flex; flex-direction: column; gap: 16px; }
   .cr-topic-chip {
-    display: inline-flex;
-    align-items: center;
-    background: var(--accent-dim);
-    border: 1px solid var(--border-accent);
-    color: var(--accent);
-    font-family: var(--font-display);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
-    padding: 5px 14px;
-    border-radius: 100px;
-    align-self: flex-start;
+    display: inline-flex; align-items: center; background: var(--accent-dim); border: 1px solid var(--border-accent);
+    color: var(--accent); font-family: var(--font-display); font-size: 10px; font-weight: 700;
+    letter-spacing: 1.5px; text-transform: uppercase; padding: 5px 14px; border-radius: 100px; align-self: flex-start;
   }
-
-  /* Metallic question card */
   .cr-question-card {
     background: linear-gradient(145deg, #1a1f32 0%, #141828 100%);
-    border: 1px solid var(--border-bright);
-    border-radius: var(--radius);
-    padding: 28px 32px;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.04) inset,
-      0 1px 2px rgba(255,255,255,0.06) inset,
-      6px 6px 20px rgba(0,0,0,0.5),
-      -2px -2px 8px rgba(255,255,255,0.02);
-    position: relative;
-    overflow: hidden;
+    border: 1px solid var(--border-bright); border-radius: var(--radius); padding: 28px 32px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset, 0 1px 2px rgba(255,255,255,0.06) inset,
+      6px 6px 20px rgba(0,0,0,0.5), -2px -2px 8px rgba(255,255,255,0.02);
+    position: relative; overflow: hidden;
   }
   .cr-question-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 1px;
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
     background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
   }
-  .cr-question-number {
-    font-family: var(--font-display);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    color: var(--text-dim);
-    margin-bottom: 14px;
-  }
-  .cr-question-text {
-    font-family: var(--font-body);
-    font-size: 18px;
-    font-weight: 400;
-    line-height: 1.75;
-    color: var(--text);
-    margin: 0;
-  }
+  .cr-question-number { font-family: var(--font-display); font-size: 10px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: var(--text-dim); margin-bottom: 14px; }
+  .cr-question-text { font-family: var(--font-body); font-size: 18px; font-weight: 400; line-height: 1.75; color: var(--text); margin: 0; }
 
-  /* ── Redemittel — Glassmorphism ─────────────────────────────────────────── */
-  .cr-redemittel {
-    background: rgba(255,255,255,0.03);
-    backdrop-filter: blur(20px);
+  /* ── Live Transcript Box ─────────────────────────────────────────────────── */
+  .cr-transcript-box {
+    background: rgba(255,255,255,0.03); backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
-    border: 1px solid rgba(255,255,255,0.09);
-    border-radius: var(--radius-sm);
+    border: 1px solid rgba(79,158,255,0.2); border-radius: var(--radius-sm);
     overflow: hidden;
-    transition: border-color 0.25s, background 0.25s;
-    position: relative;
   }
-  .cr-redemittel::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.12), transparent);
-    pointer-events: none;
+  .cr-transcript-header {
+    display: flex; align-items: center; gap: 8px; padding: 10px 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
   }
-  .cr-redemittel-open {
-    background: rgba(79,158,255,0.04);
-    border-color: rgba(79,158,255,0.22);
+  .cr-transcript-icon { font-size: 13px; }
+  .cr-transcript-label {
+    font-family: var(--font-display); font-size: 10px; font-weight: 700;
+    letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-muted); flex: 1;
   }
+  .cr-transcript-dot-live {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    animation: cr-blink 1.2s ease-in-out infinite;
+  }
+  .cr-transcript-body { padding: 14px 16px; min-height: 80px; max-height: 160px; overflow-y: auto; font-family: var(--font-body); font-size: 14px; line-height: 1.7; }
+  .cr-transcript-placeholder { color: var(--text-dim); font-style: italic; }
+  .cr-transcript-final { color: var(--text); }
+  .cr-transcript-interim { color: rgba(255,255,255,0.4); font-style: italic; }
+  .cr-transcript-partner { padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.06); }
+  .cr-transcript-partner-label { font-size: 11px; color: var(--text-dim); font-family: var(--font-display); font-weight: 600; letter-spacing: 1px; text-transform: uppercase; margin-right: 8px; }
+  .cr-transcript-partner-text { font-size: 13px; color: rgba(255,255,255,0.45); font-family: var(--font-body); }
 
-  .cr-redemittel-toggle {
-    width: 100%;
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-family: var(--font-display);
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    padding: 14px 18px;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    cursor: pointer;
-    text-align: left;
-    transition: color 0.2s;
-  }
+  /* ── Redemittel ──────────────────────────────────────────────────────────── */
+  .cr-redemittel { background: rgba(255,255,255,0.03); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.09); border-radius: var(--radius-sm); overflow: hidden; transition: border-color 0.25s, background 0.25s; position: relative; }
+  .cr-redemittel::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.12), transparent); pointer-events: none; }
+  .cr-redemittel-open { background: rgba(79,158,255,0.04); border-color: rgba(79,158,255,0.22); }
+  .cr-redemittel-toggle { width: 100%; background: none; border: none; color: var(--text-muted); font-family: var(--font-display); font-size: 12px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; padding: 14px 18px; display: flex; align-items: center; gap: 9px; cursor: pointer; text-align: left; transition: color 0.2s; }
   .cr-redemittel-toggle:hover { color: var(--text); }
-
-  .cr-redemittel-chevron {
-    font-size: 11px;
-    color: var(--accent);
-    width: 13px;
-    flex-shrink: 0;
-  }
+  .cr-redemittel-chevron { font-size: 11px; color: var(--accent); width: 13px; flex-shrink: 0; }
   .cr-redemittel-label { flex: 1; }
-  .cr-redemittel-count {
-    background: var(--surface3);
-    border: 1px solid var(--border);
-    color: var(--text-dim);
-    font-size: 10px;
-    font-family: var(--font-display);
-    padding: 2px 9px;
-    border-radius: 100px;
-  }
-
-  .cr-redemittel-body {
-    border-top: 1px solid rgba(255,255,255,0.06);
-    padding: 4px 0 12px;
-  }
-
-  .cr-redemittel-list {
-    list-style: none;
-    margin: 0;
-    padding: 0 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    max-height: 260px;
-    overflow-y: auto;
-    scrollbar-width: thin;
-    scrollbar-color: var(--surface3) transparent;
-  }
-
-  .cr-redemittel-item {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    font-family: var(--font-body);
-    font-size: 13px;
-    line-height: 1.65;
-    color: rgba(255,255,255,0.55);
-    padding: 6px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.04);
-    transition: color 0.15s;
-  }
+  .cr-redemittel-count { background: var(--surface3); border: 1px solid var(--border); color: var(--text-dim); font-size: 10px; font-family: var(--font-display); padding: 2px 9px; border-radius: 100px; }
+  .cr-redemittel-body { border-top: 1px solid rgba(255,255,255,0.06); padding: 4px 0 12px; }
+  .cr-redemittel-list { list-style: none; margin: 0; padding: 0 18px; display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--surface3) transparent; }
+  .cr-redemittel-item { display: flex; align-items: flex-start; gap: 10px; font-family: var(--font-body); font-size: 13px; line-height: 1.65; color: rgba(255,255,255,0.55); padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.04); transition: color 0.15s; }
   .cr-redemittel-item:last-child { border-bottom: none; }
   .cr-redemittel-item:hover { color: rgba(255,255,255,0.8); }
+  .cr-redemittel-bullet { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); margin-top: 8px; flex-shrink: 0; box-shadow: 0 0 4px var(--accent); }
 
-  .cr-redemittel-bullet {
-    width: 4px; height: 4px;
-    border-radius: 50%;
-    background: var(--accent);
-    margin-top: 8px;
-    flex-shrink: 0;
-    box-shadow: 0 0 4px var(--accent);
+  /* ── AI Feedback Card ────────────────────────────────────────────────────── */
+  .cr-feedback-card {
+    background: rgba(255,255,255,0.03); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(79,158,255,0.25); border-radius: var(--radius);
+    padding: 28px 32px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.03) inset, 0 12px 40px rgba(0,0,0,0.4),
+      0 0 60px rgba(79,158,255,0.04);
+    position: relative; overflow: hidden;
+  }
+  .cr-feedback-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(79,158,255,0.4), transparent);
+  }
+  .cr-feedback-loading { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 36px; }
+  .cr-feedback-spinner { display: flex; }
+  .cr-feedback-loading-text { font-family: var(--font-display); font-size: 13px; color: var(--text-muted); letter-spacing: 0.5px; }
+  .cr-feedback-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 22px; }
+  .cr-feedback-title-row { display: flex; align-items: center; gap: 10px; }
+  .cr-feedback-icon { font-size: 20px; }
+  .cr-feedback-title { font-family: var(--font-display); font-size: 16px; font-weight: 700; color: var(--text); margin: 0; }
+  .cr-feedback-stars { display: flex; align-items: center; gap: 3px; }
+  .cr-star { font-size: 18px; color: var(--surface3); transition: color 0.2s; }
+  .cr-star-filled { color: #f59e0b; filter: drop-shadow(0 0 4px rgba(245,158,11,0.5)); }
+  .cr-feedback-score-label { font-family: var(--font-display); font-size: 12px; font-weight: 700; color: var(--text-muted); margin-left: 6px; }
+  .cr-feedback-section { margin-bottom: 18px; }
+  .cr-feedback-section-last { margin-bottom: 0; }
+  .cr-feedback-section-label {
+    font-family: var(--font-display); font-size: 9px; font-weight: 700;
+    letter-spacing: 2px; text-transform: uppercase; color: var(--text-dim); margin-bottom: 8px;
+  }
+  .cr-feedback-original { font-family: var(--font-body); font-size: 14px; line-height: 1.75; color: rgba(255,255,255,0.65); margin: 0; }
+  .cr-feedback-corrected { font-family: var(--font-body); font-size: 14px; line-height: 1.75; margin: 0; }
+  .cr-feedback-errors { display: flex; flex-direction: column; gap: 8px; }
+  .cr-feedback-error-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; font-family: var(--font-body); }
+  .cr-feedback-error-orig { background: var(--red-dim); border: 1px solid rgba(255,77,77,0.2); padding: 2px 8px; border-radius: 6px; }
+  .cr-feedback-error-fix { background: var(--green-dim); border: 1px solid rgba(52,211,153,0.2); padding: 2px 8px; border-radius: 6px; }
+  .cr-feedback-arrow { color: var(--text-dim); font-size: 14px; }
+  .cr-feedback-text { font-family: var(--font-body); font-size: 14px; line-height: 1.75; color: rgba(255,255,255,0.6); margin: 0; }
+
+  /* ── Global error/corrected text utilities ───────────────────────────────── */
+  .error-text {
+    color: var(--red);
+    background: var(--red-dim);
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-style: italic;
+    text-decoration: underline wavy rgba(255,77,77,0.6);
+  }
+  .corrected-text {
+    color: var(--green);
+    background: var(--green-dim);
+    border-radius: 3px;
+    padding: 1px 4px;
   }
 
-  /* ── Self Assess ────────────────────────────────────────────────────────── */
+  /* ── Assess wide ─────────────────────────────────────────────────────────── */
+  .cr-assess-wide { display: flex; flex-direction: column; gap: 20px; width: 100%; max-width: 680px; }
+  .cr-assess-header { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .cr-assess-icon { font-size: 36px; }
+  .cr-assess-heading { font-family: var(--font-display); font-size: 26px; font-weight: 700; margin: 0; color: var(--text); }
+  .cr-assess-sub { font-family: var(--font-body); color: var(--text-muted); font-size: 14px; margin: 0; line-height: 1.6; }
   .cr-assess-card {
     background: linear-gradient(145deg, #1a1f32 0%, #141828 100%);
-    border: 1px solid var(--border-bright);
-    border-radius: var(--radius);
-    padding: 48px 40px;
-    max-width: 600px;
-    width: 100%;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.04) inset,
-      0 32px 64px rgba(0,0,0,0.6);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 18px;
-    text-align: center;
+    border: 1px solid var(--border-bright); border-radius: var(--radius); padding: 24px 28px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset, 0 16px 40px rgba(0,0,0,0.5);
+    display: flex; flex-direction: column; gap: 12px;
   }
-  .cr-assess-icon { font-size: 36px; }
-  .cr-assess-heading {
-    font-family: var(--font-display);
-    font-size: 26px;
-    font-weight: 700;
-    margin: 0;
-    color: var(--text);
-  }
-  .cr-assess-sub {
-    font-family: var(--font-body);
-    color: var(--text-muted);
-    font-size: 14px;
-    margin: 0;
-    line-height: 1.6;
-  }
-  .cr-assess-textarea {
-    width: 100%;
-    background: var(--surface3);
-    border: 1px solid var(--border-bright);
-    border-radius: var(--radius-sm);
-    color: var(--text);
-    font-family: var(--font-body);
-    font-size: 15px;
-    line-height: 1.65;
-    padding: 16px 20px;
-    resize: vertical;
-    outline: none;
-    transition: border-color 0.2s, box-shadow 0.2s;
-    box-sizing: border-box;
-  }
-  .cr-assess-textarea:focus {
-    border-color: var(--border-accent);
-    box-shadow: 0 0 0 3px rgba(79,158,255,0.1);
-  }
+  .cr-assess-notes-label { font-family: var(--font-display); font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-muted); }
+  .cr-assess-textarea { width: 100%; background: var(--surface3); border: 1px solid var(--border-bright); border-radius: var(--radius-sm); color: var(--text); font-family: var(--font-body); font-size: 15px; line-height: 1.65; padding: 14px 18px; resize: vertical; outline: none; transition: border-color 0.2s, box-shadow 0.2s; box-sizing: border-box; }
+  .cr-assess-textarea:focus { border-color: var(--border-accent); box-shadow: 0 0 0 3px rgba(79,158,255,0.1); }
   .cr-assess-textarea::placeholder { color: var(--text-dim); }
 
-  /* ── Primary Button ─────────────────────────────────────────────────────── */
+  /* ── Partner feedback ────────────────────────────────────────────────────── */
+  .cr-partner-feedback-wrap { display: flex; flex-direction: column; gap: 10px; }
+  .cr-partner-feedback-label { font-family: var(--font-display); font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: var(--text-muted); }
+
+  /* ── Primary button ──────────────────────────────────────────────────────── */
   .cr-primary-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
+    display: inline-flex; align-items: center; justify-content: center;
     background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
-    color: #fff;
-    border: none;
-    padding: 14px 34px;
-    border-radius: 100px;
-    font-family: var(--font-display);
-    font-size: 15px;
-    font-weight: 700;
-    letter-spacing: 0.2px;
+    color: #fff; border: none; padding: 14px 34px; border-radius: 100px;
+    font-family: var(--font-display); font-size: 15px; font-weight: 700; letter-spacing: 0.2px;
     cursor: pointer;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.12) inset,
-      0 8px 28px rgba(79,100,255,0.4);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.12) inset, 0 8px 28px rgba(79,100,255,0.4);
     transition: transform 0.15s, box-shadow 0.15s;
   }
-  .cr-primary-btn:hover {
-    transform: translateY(-2px);
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.15) inset,
-      0 14px 36px rgba(79,100,255,0.55);
-  }
+  .cr-primary-btn:hover { transform: translateY(-2px); box-shadow: 0 0 0 1px rgba(255,255,255,0.15) inset, 0 14px 36px rgba(79,100,255,0.55); }
   .cr-primary-btn:active { transform: translateY(0); }
 
-  /* ── Switch card ────────────────────────────────────────────────────────── */
-  .cr-switch-card {
-    background: linear-gradient(145deg, #1a1f32 0%, #141828 100%);
-    border: 1px solid var(--border-bright);
-    border-radius: var(--radius);
-    padding: 52px 44px;
-    text-align: center;
-    max-width: 380px;
-    width: 100%;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.04) inset,
-      0 24px 56px rgba(0,0,0,0.55);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 14px;
-  }
-  .cr-switch-icon-wrap {
-    width: 62px; height: 62px;
-    border-radius: 50%;
-    background: var(--accent-dim);
-    border: 1px solid var(--border-accent);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 6px;
-  }
-  .cr-switch-title {
-    font-family: var(--font-display);
-    font-size: 26px;
-    font-weight: 700;
-    margin: 0;
-    color: var(--text);
-  }
-  .cr-switch-sub {
-    font-family: var(--font-body);
-    color: var(--text-muted);
-    font-size: 14px;
-    margin: 0;
-    line-height: 1.6;
-  }
+  /* ── Switch card ─────────────────────────────────────────────────────────── */
+  .cr-switch-card { background: linear-gradient(145deg, #1a1f32 0%, #141828 100%); border: 1px solid var(--border-bright); border-radius: var(--radius); padding: 52px 44px; text-align: center; max-width: 380px; width: 100%; box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset, 0 24px 56px rgba(0,0,0,0.55); display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .cr-switch-icon-wrap { width: 62px; height: 62px; border-radius: 50%; background: var(--accent-dim); border: 1px solid var(--border-accent); display: flex; align-items: center; justify-content: center; margin-bottom: 6px; }
+  .cr-switch-title { font-family: var(--font-display); font-size: 26px; font-weight: 700; margin: 0; color: var(--text); }
+  .cr-switch-sub { font-family: var(--font-body); color: var(--text-muted); font-size: 14px; margin: 0; line-height: 1.6; }
   .cr-switch-sub strong { color: var(--accent); font-weight: 500; }
 
-  /* ── Finish card ────────────────────────────────────────────────────────── */
-  .cr-finish-card {
-    background: linear-gradient(145deg, #1a1f32 0%, #141828 100%);
-    border: 1px solid var(--border-bright);
-    border-radius: var(--radius);
-    padding: 52px 48px;
-    text-align: center;
-    max-width: 420px;
-    width: 100%;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.04) inset,
-      0 32px 72px rgba(0,0,0,0.6);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-  }
+  /* ── Finish ──────────────────────────────────────────────────────────────── */
+  .cr-finish-wide { display: flex; flex-direction: column; gap: 20px; width: 100%; max-width: 680px; }
+  .cr-finish-card { background: linear-gradient(145deg, #1a1f32 0%, #141828 100%); border: 1px solid var(--border-bright); border-radius: var(--radius); padding: 52px 48px; text-align: center; width: 100%; box-shadow: 0 0 0 1px rgba(255,255,255,0.04) inset, 0 32px 72px rgba(0,0,0,0.6); display: flex; flex-direction: column; align-items: center; gap: 8px; }
   .cr-finish-confetti { font-size: 52px; margin-bottom: 8px; }
-  .cr-finish-title {
-    font-family: var(--font-display);
-    font-size: 40px;
-    font-weight: 800;
-    margin: 0;
-    color: var(--text);
-    letter-spacing: -1px;
-  }
-  .cr-finish-sub {
-    font-family: var(--font-body);
-    color: var(--text-muted);
-    font-size: 14px;
-    margin: 0 0 12px;
-  }
+  .cr-finish-title { font-family: var(--font-display); font-size: 40px; font-weight: 800; margin: 0; color: var(--text); letter-spacing: -1px; }
+  .cr-finish-sub { font-family: var(--font-body); color: var(--text-muted); font-size: 14px; margin: 0 0 12px; }
   .cr-finish-btn { margin-top: 20px; }
+  .cr-finish-summary { display: flex; flex-direction: column; align-items: center; gap: 14px; margin: 8px 0 4px; }
+  .cr-finish-score-wrap { display: flex; }
+  .cr-finish-feedback-text { font-family: var(--font-body); font-size: 14px; color: rgba(255,255,255,0.55); line-height: 1.7; max-width: 380px; text-align: center; }
 
-  /* Score ring */
-  .cr-score-ring {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 14px;
-    margin: 8px 0 16px;
-  }
-  .cr-score-matched {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 6px;
-    justify-content: center;
-  }
-  .cr-score-matched-label {
-    font-family: var(--font-display);
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--green);
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-  }
-  .cr-score-tag {
-    background: rgba(52,211,153,0.1);
-    border: 1px solid rgba(52,211,153,0.2);
-    color: var(--green);
-    font-size: 11px;
-    font-family: var(--font-body);
-    padding: 3px 10px;
-    border-radius: 100px;
-  }
-
-  /* ── Exit Modal ─────────────────────────────────────────────────────────── */
-  .cr-modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(6,8,16,0.88);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 999;
-    padding: 24px;
-  }
-  .cr-modal-card {
-    background: linear-gradient(145deg, #1c2036 0%, #161926 100%);
-    border: 1px solid var(--border-bright);
-    border-radius: var(--radius);
-    padding: 38px 34px;
-    text-align: center;
-    max-width: 380px;
-    width: 100%;
-    box-shadow:
-      0 0 0 1px rgba(255,255,255,0.05) inset,
-      0 40px 80px rgba(0,0,0,0.7);
-    animation: modalIn 0.22s ease;
-  }
-  .cr-modal-icon-wrap {
-    width: 58px; height: 58px;
-    border-radius: 50%;
-    background: rgba(245,158,11,0.08);
-    border: 1px solid rgba(245,158,11,0.2);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: 0 auto 20px;
-  }
-  .cr-modal-title {
-    font-family: var(--font-display);
-    font-size: 20px;
-    font-weight: 700;
-    margin: 0 0 10px;
-    color: var(--text);
-  }
-  .cr-modal-body {
-    font-family: var(--font-body);
-    color: var(--text-muted);
-    font-size: 14px;
-    line-height: 1.65;
-    margin: 0;
-  }
-  .cr-modal-actions {
-    display: flex;
-    gap: 10px;
-    margin-top: 26px;
-  }
-  .cr-modal-confirm {
-    flex: 1;
-    background: rgba(255,77,77,0.1);
-    color: var(--red);
-    border: 1px solid rgba(255,77,77,0.25);
-    font-family: var(--font-display);
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.3px;
-    padding: 13px;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: background 0.2s;
-  }
+  /* ── Modal ───────────────────────────────────────────────────────────────── */
+  .cr-modal-overlay { position: fixed; inset: 0; background: rgba(6,8,16,0.88); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); display: flex; align-items: center; justify-content: center; z-index: 999; padding: 24px; }
+  .cr-modal-card { background: linear-gradient(145deg, #1c2036 0%, #161926 100%); border: 1px solid var(--border-bright); border-radius: var(--radius); padding: 38px 34px; text-align: center; max-width: 380px; width: 100%; box-shadow: 0 0 0 1px rgba(255,255,255,0.05) inset, 0 40px 80px rgba(0,0,0,0.7); animation: modalIn 0.22s ease; }
+  .cr-modal-icon-wrap { width: 58px; height: 58px; border-radius: 50%; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; }
+  .cr-modal-title { font-family: var(--font-display); font-size: 20px; font-weight: 700; margin: 0 0 10px; color: var(--text); }
+  .cr-modal-body { font-family: var(--font-body); color: var(--text-muted); font-size: 14px; line-height: 1.65; margin: 0; }
+  .cr-modal-actions { display: flex; gap: 10px; margin-top: 26px; }
+  .cr-modal-confirm { flex: 1; background: rgba(255,77,77,0.1); color: var(--red); border: 1px solid rgba(255,77,77,0.25); font-family: var(--font-display); font-size: 13px; font-weight: 700; letter-spacing: 0.3px; padding: 13px; border-radius: var(--radius-sm); cursor: pointer; transition: background 0.2s; }
   .cr-modal-confirm:hover { background: rgba(255,77,77,0.2); }
-  .cr-modal-cancel {
-    flex: 1;
-    background: var(--surface2);
-    color: var(--text-muted);
-    border: 1px solid var(--border-bright);
-    font-family: var(--font-display);
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: 0.3px;
-    padding: 13px;
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: all 0.2s;
-  }
-  .cr-modal-cancel:hover {
-    background: var(--surface3);
-    color: var(--text);
-  }
+  .cr-modal-cancel { flex: 1; background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border-bright); font-family: var(--font-display); font-size: 13px; font-weight: 700; letter-spacing: 0.3px; padding: 13px; border-radius: var(--radius-sm); cursor: pointer; transition: all 0.2s; }
+  .cr-modal-cancel:hover { background: var(--surface3); color: var(--text); }
 `;

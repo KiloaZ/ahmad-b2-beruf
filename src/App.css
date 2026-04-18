@@ -29,8 +29,10 @@
   --accent-border: rgba(79,158,255,0.4);
   --accent-glow:   rgba(79,158,255,0.3);
   --red:           #ff4d4d;
+  --red-dim:       rgba(255,77,77,0.12);
   --amber:         #f59e0b;
   --green:         #34d399;
+  --green-dim:     rgba(52,211,153,0.12);
   --shadow:        0 8px 32px rgba(0,0,0,0.5);
   --shadow-lg:     0 24px 64px rgba(0,0,0,0.65);
   --radius:        18px;
@@ -91,7 +93,7 @@ a:hover { color: #74b4ff; }
   min-height: 100vh;
 }
 
-/* ── Utility: Counter button (kept from original) ───────────────────────────── */
+/* ── Utility: Counter button ────────────────────────────────────────────────── */
 .counter {
   font-family: var(--font-display);
   font-size: 15px;
@@ -112,6 +114,43 @@ a:hover { color: #74b4ff; }
 .counter:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
+}
+
+/* ── AI Feedback: Error & Corrected text utilities ──────────────────────────── */
+/*
+  .error-text    — marks grammar/vocab errors in the original transcript (Red)
+  .corrected-text — shows the AI-corrected replacement (Green)
+
+  Used inside AI feedback cards rendered by AIFeedbackCard component,
+  and also within the dangerouslySetInnerHTML span injections in highlightErrors().
+*/
+
+.error-text {
+  color: var(--red);
+  background: var(--red-dim);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-style: italic;
+  text-decoration: underline wavy rgba(255, 77, 77, 0.55);
+  text-decoration-thickness: 1.5px;
+  transition: background 0.15s;
+}
+
+.error-text:hover {
+  background: rgba(255, 77, 77, 0.2);
+}
+
+.corrected-text {
+  color: var(--green);
+  background: var(--green-dim);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.corrected-text:hover {
+  background: rgba(52, 211, 153, 0.22);
 }
 
 /* ── Hero logo graphic area (Vite/React) ────────────────────────────────────── */
@@ -281,7 +320,7 @@ a:hover { color: #74b4ff; }
   }
 }
 
-/* ── Global card style (shared across app) ──────────────────────────────────── */
+/* ── Global card style ──────────────────────────────────────────────────────── */
 .card {
   background: linear-gradient(145deg, var(--surface) 0%, #12141f 100%);
   border: 1px solid var(--border-bright);
