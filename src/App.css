@@ -382,3 +382,40 @@ a:hover { color: #74b4ff; }
     transition-duration: 0.01ms !important;
   }
 }
+/* قفل زر الخروج أثناء التحليل */
+.cr-exit-btn-locked {
+  opacity: 0.35;
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
+
+/* شاشة التحميل (Overlay) */
+.AIAnalyzingOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(10px);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: 1200;
+  color: white;
+  font-family: sans-serif;
+}
+
+/* تلوين الأخطاء والألوان */
+.error-text {
+  color: #ff4d4d;
+  text-decoration: underline;
+  font-weight: bold;
+}
+
+.corrected-text {
+  color: #00ff88;
+  margin-top: 10px;
+  font-weight: bold;
+}
