@@ -1,39 +1,93 @@
 /**
- * ChallengeRoom.jsx — B2 Beruf Practice App
+ * ChallengeRoom.jsx — B2 Beruf · v5 Firebase-First
  *
- * Refactor v4 — Four critical fixes:
- *   1. ANDROID DEDUP  — Buffer-Compare strips overlapping suffix (up to 8 words)
- *      before any append. Covers Samsung / Chrome engine-restart duplicates.
- *      `isFinal` is gated strictly; interim never writes to transcript buffer.
- *   2. TURN CONTROLLER — `currentTurn` uid synced via Firebase.
- *      Mic button disabled when it's not your turn.
- *      On speak-end the speaker writes partner uid to `currentTurn`.
- *      Listener detects turn change and auto-enters "listening" mode.
- *   3. DUAL-PATH LIVE SYNC — Firebase `onValue` listens to both
- *      `liveTranscript/{uid}/final` and `liveTranscript/{uid}/interim`.
- *      Partner screen renders final (white) + interim (italic grey) in real time.
- *   4. REVIEW LOCK (BOTH USERS) — `isAnalyzing` flag written to Firebase.
- *      AIAnalyzingOverlay renders whenever local OR remote flag is true.
- *      Exit button and navigation are hard-disabled while either flag is set.
+ * ══════════════════════════════════════════════════════════════════════
+ *  ARCHITECTURE INVARIANTS (enforced throughout)
+ * ══════════════════════════════════════════════════════════════════════
+ *
+ *  SINGLE SOURCE OF TRUTH
+ *    rooms/{roomId}/roomState  →  {
+ *      status,            // 'intro'|'prep'|'speaking'|'analyzing'|'switching'|'finished'
+ *      currentSpeaker,    // uid of the Room Master for this turn
+ *      timerPhase,        // 'prep' | 'speak'
+ *      timerEndsAt,       // epoch-ms when the current phase ends (null = not running)
+ *      currentQuestionId, // id of the active question
+ *      round,             // 1 | 2
+ *      liveTranscript,    // { [uid]: { final: string, interim: string } }
+ *      analyzingFlags,    // { [uid]: boolean }
+ *      aiFeedback,        // { [uid]: feedbackObj }
+ *    }
+ *
+ *    ALL state changes are written to Firebase FIRST.
+ *    Local React state is ONLY populated via the onValue listener — never
+ *    written to directly in multi mode.
+ *
+ *  ROOM MASTER
+ *    The user whose uid === roomState.currentSpeaker is the Room Master.
+ *    Only the Room Master:
+ *      • calls beginSpeaking / handleSpeakEnd
+ *      • runs the master countdown interval (writes timerEndsAt once per phase)
+ *    All other clients derive their display timer from timerEndsAt via
+ *    useTimerDisplay (read-only, no Firebase writes).
+ *
+ *  TURN-TAKING
+ *    Mic is hard-disabled unless currentSpeaker === me.uid.
+ *    The Room Master sets analyzingFlags[me.uid]=true before the AI call,
+ *    then false in the finally block — both users see the overlay.
+ *
+ *  ANDROID / SAMSUNG DEDUP — v5 (triple-check)
+ *    Before any isFinal chunk is appended, sanitizeFinalChunk() runs:
+ *      a) exact-substring check against the confirmed transcript
+ *      b) suffix-overlap strip (up to 12 words)
+ *      c) Levenshtein-similarity gate (>85% → discard)
+ *    transcriptRef is always current (updated synchronously on every final),
+ *    so the comparison never reads stale state.
+ *    isFinal gate is strict: interim text NEVER touches transcriptRef or
+ *    the Firebase /final path.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ── Firebase ──────────────────────────────────────────────────────────────────
-let _firebaseDb = null;
-async function getFirebaseDB() {
-  if (_firebaseDb) return _firebaseDb;
+// ─────────────────────────────────────────────────────────────────────────────
+// Firebase thin wrappers
+// ─────────────────────────────────────────────────────────────────────────────
+let _db = null;
+async function getDB() {
+  if (_db) return _db;
   try {
-    const { db } = await import("./firebase-config.js");
-    _firebaseDb = db;
-    return _firebaseDb;
+    const mod = await import("./firebase-config.js");
+    _db = mod.db;
+    return _db;
   } catch {
-    console.warn("ChallengeRoom: Firebase not configured — running offline.");
+    console.warn("ChallengeRoom: Firebase not configured — solo/offline only.");
     return null;
   }
 }
 
-// ── Audio ─────────────────────────────────────────────────────────────────────
+async function fbSet(path, value) {
+  const db = await getDB(); if (!db) return;
+  const { ref, set } = await import("firebase/database");
+  await set(ref(db, path), value);
+}
+
+async function fbUpdate(path, partial) {
+  const db = await getDB(); if (!db) return;
+  const { ref, update } = await import("firebase/database");
+  await update(ref(db, path), partial);
+}
+
+/** Subscribe and return an unsubscribe fn. */
+async function fbListen(path, cb) {
+  const db = await getDB(); if (!db) return () => {};
+  const { ref, onValue, off } = await import("firebase/database");
+  const r = ref(db, path);
+  onValue(r, snap => cb(snap.exists() ? snap.val() : null));
+  return () => off(r);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio
+// ─────────────────────────────────────────────────────────────────────────────
 function playBeep({ freq = 880, duration = 0.18, type = "sine", gain = 0.35 } = {}) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -42,94 +96,116 @@ function playBeep({ freq = 880, duration = 0.18, type = "sine", gain = 0.35 } = 
     osc.type = type; osc.frequency.value = freq;
     env.gain.setValueAtTime(gain, ctx.currentTime);
     env.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + duration);
-  } catch { /* AudioContext unavailable in some environments */ }
+    osc.start(); osc.stop(ctx.currentTime + duration);
+  } catch { /* ignore in restricted environments */ }
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-const PREP_DURATION  = 30;
-const SPEAK_DURATION = 180;
-const OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY;
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+const PREP_SEC  = 30;
+const SPEAK_SEC = 180;
+const OA_KEY    = import.meta.env.VITE_OPENAI_API_KEY;
 
-const OPENAI_SYSTEM_PROMPT = `You are a professional German language tutor. Analyze the user's transcript for grammar and vocabulary errors. Provide a JSON response with:
+const AI_PROMPT = `You are a professional German language tutor. Analyze the user's transcript for grammar and vocabulary errors. Provide a JSON response with:
 - score (integer 1-5)
 - correctedText (the perfect version of what the user said)
 - feedback (concise, encouraging explanation in German, 2-4 sentences)
 - errors (array of objects: { original: string, correction: string })
 Respond ONLY with valid JSON. No markdown, no backticks.`;
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure helpers
+// ─────────────────────────────────────────────────────────────────────────────
 function pickRandom(questions, usedIds) {
   const pool = questions.filter(q => !usedIds.includes(q.id));
-  const src  = pool.length > 0 ? pool : questions;
+  const src  = pool.length ? pool : questions;
   return src[Math.floor(Math.random() * src.length)];
-}
-
-function scoreAnswer(userText, redemittel) {
-  if (!userText?.trim() || !redemittel?.length)
-    return { score: 0, matched: [], missed: redemittel || [], pct: 0 };
-  const lower = userText.toLowerCase();
-  const matched = [], missed = [];
-  for (const r of redemittel) {
-    const kw = r.toLowerCase().split(/[\s,]+/).slice(0, 2).join(" ");
-    (lower.includes(kw) ? matched : missed).push(r);
-  }
-  const pct = matched.length / redemittel.length;
-  return { score: Math.round(2 + pct * 8), matched, missed, pct };
 }
 
 function highlightErrors(text, errors = []) {
   if (!text || !errors.length) return text;
-  let result = text;
+  let out = text;
   errors.forEach(({ original }) => {
     if (!original) return;
     const esc = original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    result = result.replace(new RegExp(`(${esc})`, "gi"),
-      `<span class="error-text">$1</span>`);
+    out = out.replace(new RegExp(`(${esc})`, "gi"), `<span class="error-text">$1</span>`);
   });
-  return result;
+  return out;
 }
 
-// ── FIX 1: Buffer-Compare Dedup ───────────────────────────────────────────────
-// Compares the tail of `existing` (up to 8 words) against the head of `newChunk`.
-// If they overlap, the overlapping prefix is stripped from `newChunk`.
-// This resolves Samsung / Chrome engine-restart duplicate emissions.
-function sanitizeFinalChunk(existing, newChunk) {
-  const trimmed = newChunk.trim();
+// ─────────────────────────────────────────────────────────────────────────────
+// Android / Samsung Dedup — v5 triple-check
+// ─────────────────────────────────────────────────────────────────────────────
+function levenshtein(a, b, cap = 40) {
+  if (Math.abs(a.length - b.length) > cap) return cap + 1;
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = i;
+    for (let j = 1; j <= b.length; j++) {
+      const val = a[i-1] === b[j-1] ? row[j-1] : 1 + Math.min(row[j-1], row[j], prev);
+      row[j-1] = prev; prev = val;
+    }
+    row[b.length] = prev;
+  }
+  return row[b.length];
+}
+
+/**
+ * sanitizeFinalChunk — v5
+ *
+ * Returns the sanitized text to APPEND to the confirmed transcript.
+ * Returns "" if the chunk is a duplicate or near-duplicate.
+ *
+ * Stages:
+ *   1. Exact substring — chunk already present in existing → ""
+ *   2. Suffix-overlap  — strip head (up to 12 words) if overlap found
+ *   3. Levenshtein similarity gate — >85% similar to tail window → ""
+ */
+function sanitizeFinalChunk(existing, chunk) {
+  const trimmed = chunk.trim();
   if (!trimmed) return "";
   if (!existing) return trimmed;
 
-  // Normalise for comparison only — don't mutate return value
   const normE = existing.toLowerCase().replace(/\s+/g, " ").trim();
-  const normN = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
+  const normC = trimmed.toLowerCase().replace(/\s+/g, " ").trim();
 
-  // Exact duplicate tail
-  if (normE.endsWith(normN)) return "";
+  // Stage 1 — exact substring
+  if (normE.includes(normC)) return "";
 
-  // Suffix overlap of 2–8 words
+  // Stage 2 — suffix-overlap strip (up to 12 words)
   const words = normE.split(" ");
-  for (let len = Math.min(8, words.length); len >= 2; len--) {
+  for (let len = Math.min(12, words.length); len >= 2; len--) {
     const suffix = words.slice(-len).join(" ");
-    if (normN.startsWith(suffix)) {
-      // Strip exactly `suffix.length` characters (accounting for case difference)
+    if (normC.startsWith(suffix)) {
       const stripped = trimmed.slice(suffix.length).trimStart();
+      if (!stripped) return "";
+      if (normE.includes(stripped.toLowerCase())) return "";
       return stripped;
     }
   }
+
+  // Stage 3 — Levenshtein similarity gate
+  const window = normE.slice(-Math.min(normC.length * 2, normE.length));
+  const dist   = levenshtein(normC, window, Math.ceil(normC.length * 0.5));
+  const sim    = 1 - dist / Math.max(normC.length, window.length, 1);
+  if (sim > 0.85) return "";
+
   return trimmed;
 }
 
-// ── OpenAI ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI
+// ─────────────────────────────────────────────────────────────────────────────
 async function fetchAIFeedback(transcript) {
-  if (!OPENAI_API_KEY) { console.warn("No VITE_OPENAI_API_KEY."); return null; }
-  if (!transcript?.trim()) return null;
+  if (!OA_KEY || !transcript?.trim()) return null;
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OA_KEY}` },
     body: JSON.stringify({
       model: "gpt-4o-mini", max_tokens: 800, temperature: 0.3,
       messages: [
-        { role: "system", content: OPENAI_SYSTEM_PROMPT },
+        { role: "system", content: AI_PROMPT },
         { role: "user",   content: transcript.trim() },
       ],
     }),
@@ -138,78 +214,68 @@ async function fetchAIFeedback(transcript) {
   const data = await res.json();
   const raw  = data.choices?.[0]?.message?.content || "";
   try { return JSON.parse(raw.replace(/```json|```/g, "").trim()); }
-  catch { console.error("AI parse error:", raw); return null; }
+  catch { console.error("AI JSON parse:", raw); return null; }
 }
 
-// ── FIX 1+3: Speech Recognition Hook ─────────────────────────────────────────
-// • isFinal strictly gated — interim text NEVER touches the transcript buffer.
-// • onFinal receives a raw chunk; caller runs sanitizeFinalChunk.
-// • onInterimSync pushes interim to Firebase path for partner.
-// • Debounced interim display (80 ms) eliminates engine-restart flicker.
-function useSpeechRecognition({ onInterim, onFinal, onInterimSync, active }) {
-  const recogRef        = useRef(null);
-  const activeRef       = useRef(active);
-  const interimDebounce = useRef(null);
+// ─────────────────────────────────────────────────────────────────────────────
+// Speech Recognition Hook
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * isFinal is STRICTLY gated — interim never calls onFinal.
+ * Engine is auto-restarted on onend when active=true (Android crash recovery).
+ * Interim calls are debounced 80ms to suppress engine-restart flicker.
+ */
+function useSpeechRecognition({ onFinal, onInterim, onInterimSync, active }) {
+  const recogRef    = useRef(null);
+  const activeRef   = useRef(active);
+  const debounceRef = useRef(null);
   useEffect(() => { activeRef.current = active; }, [active]);
 
   const start = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { console.warn("SpeechRecognition not supported"); return; }
+    if (!SR) { console.warn("SpeechRecognition not available"); return; }
     if (recogRef.current) { try { recogRef.current.stop(); } catch { /* ignore */ } }
 
     const r = new SR();
-    r.continuous      = true;
-    r.interimResults  = true;
-    r.lang            = "de-DE";
-    r.maxAlternatives = 1;
+    r.continuous = true; r.interimResults = true;
+    r.lang = "de-DE"; r.maxAlternatives = 1;
 
     r.onresult = (e) => {
-      let interimAccum = "";
-      let finalAccum   = "";
-
+      let interim = "", finals = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) {
-          // FIX 1: only confirmed speech goes to finalAccum
-          finalAccum += t + " ";
-        } else {
-          interimAccum += t;
-        }
+        if (e.results[i].isFinal) finals  += t + " "; // STRICT gate
+        else                       interim += t;
       }
-
-      if (interimAccum) {
-        clearTimeout(interimDebounce.current);
-        interimDebounce.current = setTimeout(() => {
-          onInterim?.(interimAccum);
-          onInterimSync?.(interimAccum); // FIX 3: push interim to Firebase
+      if (interim) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => {
+          onInterim?.(interim);
+          onInterimSync?.(interim);
         }, 80);
       }
-
-      if (finalAccum) {
-        clearTimeout(interimDebounce.current); // cancel pending interim on final
-        onFinal?.(finalAccum.trimEnd());        // FIX 1: caller deduplicates
+      if (finals) {
+        clearTimeout(debounceRef.current);
+        onFinal?.(finals.trimEnd());
       }
     };
 
     r.onerror = (e) => {
       if (e.error !== "no-speech" && e.error !== "aborted")
-        console.warn("SpeechRecognition error:", e.error);
+        console.warn("Speech error:", e.error);
     };
 
     r.onend = () => {
-      // Auto-restart only when still active (handles engine crashes on Android)
-      if (activeRef.current) {
-        try { r.start(); } catch { /* race condition on rapid stop/start */ }
-      }
+      if (activeRef.current) try { r.start(); } catch { /* ignore */ }
     };
 
     recogRef.current = r;
-    try { r.start(); } catch { /* may throw if mic permission denied */ }
-  }, [onInterim, onFinal, onInterimSync]);
+    try { r.start(); } catch { /* permission denied */ }
+  }, [onFinal, onInterim, onInterimSync]);
 
   const stop = useCallback(() => {
     activeRef.current = false;
-    clearTimeout(interimDebounce.current);
+    clearTimeout(debounceRef.current);
     try { recogRef.current?.stop(); } catch { /* ignore */ }
     recogRef.current = null;
   }, []);
@@ -217,40 +283,54 @@ function useSpeechRecognition({ onInterim, onFinal, onInterimSync, active }) {
   return { start, stop };
 }
 
-// ── Circular SVG Timer ────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Timer display hook — reads timerEndsAt from roomState (no writes)
+// ─────────────────────────────────────────────────────────────────────────────
+function useTimerDisplay(timerEndsAt, totalSec) {
+  const [timeLeft, setTimeLeft] = useState(totalSec);
+  useEffect(() => {
+    if (!timerEndsAt) { setTimeLeft(totalSec); return; }
+    const tick = () => setTimeLeft(Math.max(0, Math.round((timerEndsAt - Date.now()) / 1000)));
+    tick();
+    const id = setInterval(tick, 500);
+    return () => clearInterval(id);
+  }, [timerEndsAt, totalSec]);
+  return timeLeft;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SVG Circular Timer
+// ─────────────────────────────────────────────────────────────────────────────
 function CircularTimer({ timeLeft, totalTime, phase }) {
   const R = 54, C = 2 * Math.PI * R;
-  const offset    = C * (1 - timeLeft / totalTime);
-  const isUrgent  = timeLeft <= 5;
-  const isWarning = timeLeft <= 30;
-  const pc = isUrgent ? "#ff4d4d" : isWarning ? "#f59e0b" : "#4f9eff";
-  const gc = isUrgent ? "rgba(255,77,77,.5)" : isWarning ? "rgba(245,158,11,.5)" : "rgba(79,158,255,.5)";
-  const mins = String(Math.floor(timeLeft / 60)).padStart(2, "0");
-  const secs = String(timeLeft % 60).padStart(2, "0");
+  const off    = C * (1 - timeLeft / totalTime);
+  const urgent = timeLeft <= 5, warn = timeLeft <= 30;
+  const pc = urgent ? "#ff4d4d" : warn ? "#f59e0b" : "#4f9eff";
+  const gc = urgent ? "rgba(255,77,77,.5)" : warn ? "rgba(245,158,11,.5)" : "rgba(79,158,255,.5)";
+  const mm = String(Math.floor(timeLeft / 60)).padStart(2, "0");
+  const ss = String(timeLeft % 60).padStart(2, "0");
   return (
-    <div className={`cr-timer-wrap${isUrgent ? " cr-timer-urgent" : ""}`}>
-      <svg viewBox="0 0 128 128" width="148" height="148" style={{ overflow: "visible" }}>
+    <div className={`cr-timer-wrap${urgent ? " cr-timer-urgent" : ""}`}>
+      <svg viewBox="0 0 128 128" width="148" height="148" style={{ overflow:"visible" }}>
         <defs>
-          <radialGradient id="timerFace" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#1e2236" />
-            <stop offset="100%" stopColor="#12141d" />
+          <radialGradient id="crTF" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="#1e2236"/><stop offset="100%" stopColor="#12141d"/>
           </radialGradient>
         </defs>
-        <circle cx="64" cy="64" r="58" fill="url(#timerFace)" />
-        <circle cx="64" cy="64" r="62" fill="none" stroke="rgba(255,255,255,.06)" strokeWidth="2" />
-        <circle cx="64" cy="64" r={R} fill="none" stroke="rgba(255,255,255,.05)" strokeWidth="9" />
+        <circle cx="64" cy="64" r="58" fill="url(#crTF)"/>
+        <circle cx="64" cy="64" r="62" fill="none" stroke="rgba(255,255,255,.06)" strokeWidth="2"/>
+        <circle cx="64" cy="64" r={R} fill="none" stroke="rgba(255,255,255,.05)" strokeWidth="9"/>
         <circle cx="64" cy="64" r={R} fill="none" stroke={gc} strokeWidth="9" strokeLinecap="round"
-          strokeDasharray={C} strokeDashoffset={offset} transform="rotate(-90 64 64)"
-          style={{ filter: "blur(6px)", transition: "stroke-dashoffset .5s linear,stroke .4s ease" }} />
+          strokeDasharray={C} strokeDashoffset={off} transform="rotate(-90 64 64)"
+          style={{ filter:"blur(6px)", transition:"stroke-dashoffset .5s linear,stroke .4s" }}/>
         <circle cx="64" cy="64" r={R} fill="none" stroke={pc} strokeWidth="7" strokeLinecap="round"
-          strokeDasharray={C} strokeDashoffset={offset} transform="rotate(-90 64 64)"
-          style={{ transition: "stroke-dashoffset .5s linear,stroke .4s ease" }} />
-        <text x="64" y="58" textAnchor="middle" dominantBaseline="middle"
-          fill={isUrgent ? "#ff4d4d" : "#fff"} fontSize="22" fontWeight="700"
-          fontFamily="'Syne',sans-serif" style={{ transition: "fill .4s ease" }}>{mins}:{secs}</text>
-        <text x="64" y="77" textAnchor="middle" dominantBaseline="middle"
-          fill="rgba(255,255,255,.35)" fontSize="8" fontWeight="500"
-          fontFamily="'Syne',sans-serif" letterSpacing="2">
+          strokeDasharray={C} strokeDashoffset={off} transform="rotate(-90 64 64)"
+          style={{ transition:"stroke-dashoffset .5s linear,stroke .4s" }}/>
+        <text x="64" y="57" textAnchor="middle" dominantBaseline="middle"
+          fill={urgent ? "#ff4d4d" : "#fff"} fontSize="22" fontWeight="700"
+          fontFamily="'Syne',sans-serif" style={{ transition:"fill .4s" }}>{mm}:{ss}</text>
+        <text x="64" y="76" textAnchor="middle" dominantBaseline="middle"
+          fill="rgba(255,255,255,.35)" fontSize="8" fontFamily="'Syne',sans-serif" letterSpacing="2">
           {phase === "prep" ? "VORBEREITUNG" : "SPRECHEN"}
         </text>
       </svg>
@@ -258,88 +338,69 @@ function CircularTimer({ timeLeft, totalTime, phase }) {
   );
 }
 
-// ── FIX 3: Live Transcript Box ────────────────────────────────────────────────
-// Shows speaker's own transcript, and partner's transcript (final + interim).
-// Final text is white; interim is italic grey — matches the speaker's view.
-function LiveTranscriptBox({ transcript, interimText, partnerTranscript, partnerInterim, isMulti, isSpeaker }) {
-  const bottomRef = useRef(null);
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcript, interimText, partnerTranscript, partnerInterim]);
-
+// ─────────────────────────────────────────────────────────────────────────────
+// Live Transcript Box
+// ─────────────────────────────────────────────────────────────────────────────
+function LiveTranscriptBox({ myFinal, myInterim, partnerFinal, partnerInterim, isSpeaker, isMulti }) {
+  const endRef = useRef(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior:"smooth" }); },
+    [myFinal, myInterim, partnerFinal, partnerInterim]);
   return (
     <div className="cr-transcript-box">
       <div className="cr-transcript-header">
-        <span className="cr-transcript-icon">🎙</span>
-        <span className="cr-transcript-label">
-          {isSpeaker ? "Dein Live-Transkript" : "Live-Transkript (Sprecher)"}
-        </span>
-        <span className="cr-transcript-dot cr-transcript-dot-live" />
+        <span className="cr-ti-icon">🎙</span>
+        <span className="cr-ti-label">{isSpeaker ? "Dein Live-Transkript" : "Sprecher · Live"}</span>
+        <span className="cr-ti-live-dot"/>
       </div>
-
-      {/* Speaker sees own transcript */}
-      {isSpeaker && (
-        <div className="cr-transcript-body">
-          {!transcript && !interimText &&
-            <span className="cr-transcript-placeholder">Fang an zu sprechen…</span>}
-          <span className="cr-transcript-final">{transcript}</span>
-          {interimText && <span className="cr-transcript-interim"> {interimText}</span>}
-          <div ref={bottomRef} />
-        </div>
-      )}
-
-      {/* Listener (not speaker) sees partner transcript via Firebase — FIX 3 */}
-      {!isSpeaker && isMulti && (
-        <div className="cr-transcript-body">
-          {!partnerTranscript && !partnerInterim &&
-            <span className="cr-transcript-placeholder">Wartet auf Sprecher…</span>}
-          <span className="cr-transcript-final">{partnerTranscript}</span>
-          {partnerInterim && <span className="cr-transcript-interim"> {partnerInterim}</span>}
-          <div ref={bottomRef} />
-        </div>
-      )}
-
-      {/* Speaker also sees partner's text (small strip) */}
-      {isSpeaker && isMulti && partnerTranscript && (
-        <div className="cr-transcript-partner">
-          <span className="cr-transcript-partner-label">Partner:</span>
-          <span className="cr-transcript-partner-text">{partnerTranscript}</span>
+      <div className="cr-ti-body">
+        {isSpeaker ? (
+          <>
+            {!myFinal && !myInterim && <span className="cr-ti-ph">Fang an zu sprechen…</span>}
+            <span className="cr-ti-final">{myFinal}</span>
+            {myInterim && <span className="cr-ti-interim"> {myInterim}</span>}
+          </>
+        ) : (
+          <>
+            {!partnerFinal && !partnerInterim && <span className="cr-ti-ph">Wartet auf Sprecher…</span>}
+            <span className="cr-ti-final">{partnerFinal}</span>
+            {partnerInterim && <span className="cr-ti-interim"> {partnerInterim}</span>}
+          </>
+        )}
+        <div ref={endRef}/>
+      </div>
+      {isSpeaker && isMulti && partnerFinal && (
+        <div className="cr-ti-partner">
+          <span className="cr-ti-plabel">Partner:</span>
+          <span className="cr-ti-ptext">{partnerFinal}</span>
         </div>
       )}
     </div>
   );
 }
 
-// ── FIX 4: AI Analysing Overlay ───────────────────────────────────────────────
-// Rendered whenever `isAnalyzing` is true for local OR remote user.
-// Blocks all interaction — pointer events on children are disabled at root level.
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Analysing Overlay  (both users see this simultaneously via Firebase flag)
+// ─────────────────────────────────────────────────────────────────────────────
 function AIAnalyzingOverlay() {
   return (
     <div className="cr-ai-overlay" role="dialog" aria-modal="true" aria-label="KI analysiert">
-      <div className="cr-ai-overlay-card">
-        <div className="cr-ai-overlay-ring-wrap">
+      <div className="cr-ai-card">
+        <div className="cr-ai-ring">
           <svg width="80" height="80" viewBox="0 0 80 80">
-            <circle cx="40" cy="40" r="34" fill="none" stroke="rgba(79,158,255,.12)" strokeWidth="5" />
+            <circle cx="40" cy="40" r="34" fill="none" stroke="rgba(79,158,255,.12)" strokeWidth="5"/>
             <circle cx="40" cy="40" r="34" fill="none" stroke="#4f9eff" strokeWidth="5"
               strokeLinecap="round" strokeDasharray="60 154"
-              style={{ animation: "cr-spin 1.1s linear infinite", transformOrigin: "center" }} />
+              style={{ animation:"cr-spin 1.1s linear infinite", transformOrigin:"center" }}/>
           </svg>
-          <span className="cr-ai-overlay-emoji">🤖</span>
+          <span className="cr-ai-emoji">🤖</span>
         </div>
-        <h3 className="cr-ai-overlay-title">Analysiere deine Antwort…</h3>
-        <p className="cr-ai-overlay-sub">
-          Die KI überprüft Grammatik und Wortschatz.<br />Bitte einen Moment warten.
-        </p>
-        <div className="cr-ai-overlay-dots">
-          <span className="cr-ai-dot" style={{ animationDelay: "0s" }} />
-          <span className="cr-ai-dot" style={{ animationDelay: ".18s" }} />
-          <span className="cr-ai-dot" style={{ animationDelay: ".36s" }} />
+        <h3 className="cr-ai-title">Analysiere deine Antwort…</h3>
+        <p className="cr-ai-sub">Die KI überprüft Grammatik und Wortschatz.<br/>Bitte einen Moment warten.</p>
+        <div className="cr-ai-dots">
+          {[0,.18,.36].map((d,i) => <span key={i} className="cr-ai-dot" style={{ animationDelay:`${d}s` }}/>)}
         </div>
-        <p className="cr-ai-overlay-lock-note">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" style={{ marginRight: 5, flexShrink: 0 }}>
-            <rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" strokeWidth="2" />
-            <path d="M7 11V7a5 5 0 0110 0v4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-          </svg>
+        <p className="cr-ai-lock">
+          <LockIcon size={12} style={{ marginRight:5 }}/>
           Ansicht bleibt geöffnet bis die Analyse abgeschlossen ist
         </p>
       </div>
@@ -347,145 +408,217 @@ function AIAnalyzingOverlay() {
   );
 }
 
-// ── AI Feedback Card ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Icon helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function LockIcon({ size=17, style }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" style={style}>
+      <rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" strokeWidth="2"/>
+      <path d="M7 11V7a5 5 0 0110 0v4" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    </svg>
+  );
+}
+function CloseIcon({ size=17 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+      <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    </svg>
+  );
+}
+function MicOnIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+      <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" fill="currentColor"/>
+      <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    </svg>
+  );
+}
+function MicOffIcon() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
+      <line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2a7 7 0 01-.11 1.23M12 19v4M8 23h8"
+        stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI Feedback Card
+// ─────────────────────────────────────────────────────────────────────────────
 function AIFeedbackCard({ feedback, transcript, isLoading }) {
   if (isLoading) return (
-    <div className="cr-feedback-card cr-feedback-loading">
-      <div className="cr-feedback-spinner">
-        <svg width="32" height="32" viewBox="0 0 32 32">
-          <circle cx="16" cy="16" r="12" fill="none" stroke="rgba(79,158,255,.2)" strokeWidth="3" />
-          <circle cx="16" cy="16" r="12" fill="none" stroke="#4f9eff" strokeWidth="3"
-            strokeLinecap="round" strokeDasharray="40 36"
-            style={{ animation: "cr-spin 1s linear infinite", transformOrigin: "center" }} />
-        </svg>
-      </div>
-      <p className="cr-feedback-loading-text">KI analysiert deine Antwort…</p>
+    <div className="cr-fc cr-fc-loading">
+      <svg width="32" height="32" viewBox="0 0 32 32">
+        <circle cx="16" cy="16" r="12" fill="none" stroke="rgba(79,158,255,.2)" strokeWidth="3"/>
+        <circle cx="16" cy="16" r="12" fill="none" stroke="#4f9eff" strokeWidth="3"
+          strokeLinecap="round" strokeDasharray="40 36"
+          style={{ animation:"cr-spin 1s linear infinite", transformOrigin:"center" }}/>
+      </svg>
+      <p className="cr-fc-loading-text">KI analysiert…</p>
     </div>
   );
   if (!feedback) return null;
-  const { score = 0, correctedText, feedback: feedbackText, errors = [] } = feedback;
-  const highlighted = highlightErrors(transcript, errors);
-  const stars = Array.from({ length: 5 }, (_, i) => i < score);
+  const { score=0, correctedText, feedback:fb, errors=[] } = feedback;
+  const hl    = highlightErrors(transcript, errors);
+  const stars = Array.from({ length:5 }, (_,i) => i < score);
   return (
-    <div className="cr-feedback-card">
-      <div className="cr-feedback-header">
-        <div className="cr-feedback-title-row">
-          <span className="cr-feedback-icon">🤖</span>
-          <h3 className="cr-feedback-title">KI-Auswertung</h3>
-        </div>
-        <div className="cr-feedback-stars">
-          {stars.map((f, i) => <span key={i} className={`cr-star${f ? " cr-star-filled" : ""}`}>★</span>)}
-          <span className="cr-feedback-score-label">{score}/5</span>
+    <div className="cr-fc">
+      <div className="cr-fc-header">
+        <div className="cr-fc-title-row"><span className="cr-fc-icon">🤖</span><h3 className="cr-fc-title">KI-Auswertung</h3></div>
+        <div className="cr-fc-stars">
+          {stars.map((f,i) => <span key={i} className={`cr-star${f?" cr-star-on":""}`}>★</span>)}
+          <span className="cr-fc-score">{score}/5</span>
         </div>
       </div>
       {transcript && (
-        <div className="cr-feedback-section">
-          <div className="cr-feedback-section-label">Dein Text</div>
-          <p className="cr-feedback-original" dangerouslySetInnerHTML={{ __html: highlighted }} />
+        <div className="cr-fc-sec">
+          <div className="cr-fc-label">Dein Text</div>
+          <p className="cr-fc-orig" dangerouslySetInnerHTML={{ __html:hl }}/>
         </div>
       )}
       {correctedText && (
-        <div className="cr-feedback-section">
-          <div className="cr-feedback-section-label">Korrektur</div>
-          <p className="cr-feedback-corrected corrected-text">{correctedText}</p>
+        <div className="cr-fc-sec">
+          <div className="cr-fc-label">Korrektur</div>
+          <p className="cr-fc-corr corrected-text">{correctedText}</p>
         </div>
       )}
       {errors.length > 0 && (
-        <div className="cr-feedback-section">
-          <div className="cr-feedback-section-label">Fehler</div>
-          <div className="cr-feedback-errors">
-            {errors.map((e, i) => (
-              <div key={i} className="cr-feedback-error-row">
-                <span className="error-text cr-feedback-error-orig">{e.original}</span>
-                <span className="cr-feedback-arrow">→</span>
-                <span className="corrected-text cr-feedback-error-fix">{e.correction}</span>
+        <div className="cr-fc-sec">
+          <div className="cr-fc-label">Fehler</div>
+          <div className="cr-fc-errors">
+            {errors.map((e,i) => (
+              <div key={i} className="cr-fc-erow">
+                <span className="error-text cr-fc-eorig">{e.original}</span>
+                <span className="cr-fc-arrow">→</span>
+                <span className="corrected-text cr-fc-efix">{e.correction}</span>
               </div>
             ))}
           </div>
         </div>
       )}
-      {feedbackText && (
-        <div className="cr-feedback-section cr-feedback-section-last">
-          <div className="cr-feedback-section-label">Feedback</div>
-          <p className="cr-feedback-text">{feedbackText}</p>
+      {fb && (
+        <div className="cr-fc-sec cr-fc-sec-last">
+          <div className="cr-fc-label">Feedback</div>
+          <p className="cr-fc-text">{fb}</p>
         </div>
       )}
     </div>
   );
 }
 
-// ── Redemittel Panel ──────────────────────────────────────────────────────────
-function RedemittelPanel({ items = [] }) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Redemittel Panel
+// ─────────────────────────────────────────────────────────────────────────────
+const DEFAULT_RDMT = [
+  "Ich möchte zunächst darauf hinweisen, dass …",
+  "Meiner Meinung nach ist es wichtig, …",
+  "Ein wesentlicher Aspekt dabei ist …",
+  "Auf der anderen Seite muss man bedenken, …",
+  "Zusammenfassend lässt sich sagen, dass …",
+  "Ich stimme zu / Ich stimme nicht zu, weil …",
+  "Das hat den Vorteil / Nachteil, dass …",
+  "Darf ich kurz etwas dazu sagen?",
+  "Was ich damit sagen möchte, ist …",
+  "Ich finde, dass man hierbei unterscheiden muss zwischen …",
+];
+function RedemittelPanel({ items=[] }) {
   const [open, setOpen] = useState(false);
-  const list = items.length > 0 ? items : [
-    "Ich möchte zunächst darauf hinweisen, dass …",
-    "Meiner Meinung nach ist es wichtig, …",
-    "Ein wesentlicher Aspekt dabei ist …",
-    "Auf der anderen Seite muss man bedenken, …",
-    "Zusammenfassend lässt sich sagen, dass …",
-    "Ich stimme zu / Ich stimme nicht zu, weil …",
-    "Das hat den Vorteil / Nachteil, dass …",
-    "Darf ich kurz etwas dazu sagen?",
-    "Was ich damit sagen möchte, ist …",
-    "Ich finde, dass man hierbei unterscheiden muss zwischen …",
-  ];
+  const list = items.length ? items : DEFAULT_RDMT;
   return (
-    <div className={`cr-redemittel${open ? " cr-redemittel-open" : ""}`}>
-      <button className="cr-redemittel-toggle" onClick={() => setOpen(o => !o)}>
-        <span className="cr-redemittel-chevron">{open ? "▾" : "▸"}</span>
-        <span className="cr-redemittel-label">Redemittel</span>
-        <span className="cr-redemittel-count">{list.length}</span>
+    <div className={`cr-rdm${open?" cr-rdm-open":""}`}>
+      <button className="cr-rdm-toggle" onClick={() => setOpen(o => !o)}>
+        <span className="cr-rdm-chev">{open?"▾":"▸"}</span>
+        <span className="cr-rdm-lbl">Redemittel</span>
+        <span className="cr-rdm-cnt">{list.length}</span>
       </button>
       {open && (
-        <div className="cr-redemittel-body">
-          <ul className="cr-redemittel-list">
-            {list.map((item, i) => (
-              <li key={i} className="cr-redemittel-item">
-                <span className="cr-redemittel-bullet" /><span>{item}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
+        <ul className="cr-rdm-list">
+          {list.map((item,i) => (
+            <li key={i} className="cr-rdm-item">
+              <span className="cr-rdm-dot"/><span>{item}</span>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
 }
 
-// ── Exit Confirm Modal ────────────────────────────────────────────────────────
-function ExitConfirmModal({ onConfirm, onCancel }) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Exit Confirm Modal
+// ─────────────────────────────────────────────────────────────────────────────
+function ExitModal({ onConfirm, onCancel }) {
   return (
     <div className="cr-modal-overlay">
-      <div className="cr-modal-card">
-        <div className="cr-modal-icon-wrap">
+      <div className="cr-modal">
+        <div className="cr-modal-icon">
           <svg width="26" height="26" viewBox="0 0 24 24" fill="none">
             <path d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"
-              stroke="#f59e0b" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+              stroke="#f59e0b" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
           </svg>
         </div>
         <h3 className="cr-modal-title">Übung abbrechen?</h3>
         <p className="cr-modal-body">Bist du sicher? Dein Fortschritt wird nicht gespeichert.</p>
-        <div className="cr-modal-actions">
-          <button className="cr-modal-confirm" onClick={onConfirm}>Ja, beenden</button>
-          <button className="cr-modal-cancel"  onClick={onCancel}>Weitermachen</button>
+        <div className="cr-modal-btns">
+          <button className="cr-modal-yes" onClick={onConfirm}>Ja, beenden</button>
+          <button className="cr-modal-no"  onClick={onCancel}>Weitermachen</button>
         </div>
       </div>
     </div>
   );
 }
 
-// ── FIX 2: Turn Indicator Badge ───────────────────────────────────────────────
-function TurnIndicatorBadge({ isMyTurn, partnerName }) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Turn Badge
+// ─────────────────────────────────────────────────────────────────────────────
+function TurnBadge({ mine, partnerName }) {
   return (
-    <div className={`cr-turn-badge${isMyTurn ? " cr-turn-badge-mine" : " cr-turn-badge-partner"}`}>
-      {isMyTurn
-        ? <><span className="cr-turn-dot cr-turn-dot-mine" />Du bist dran</>
-        : <><span className="cr-turn-dot cr-turn-dot-partner" />{partnerName} spricht</>
-      }
+    <div className={`cr-turn${mine?" cr-turn-mine":" cr-turn-other"}`}>
+      <span className={`cr-turn-dot${mine?" cr-turn-dot-mine":""}`}/>
+      {mine ? "Du bist dran" : `${partnerName} spricht`}
     </div>
   );
 }
 
-// ── Main Component ────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Header
+// ─────────────────────────────────────────────────────────────────────────────
+function Header({ round, partnerName, isMulti, blockExit, onExit, isRecording, amSpeaker }) {
+  return (
+    <header className="cr-header">
+      <div className="cr-logo">
+        <span className="cr-logo-b2">B2</span><span className="cr-logo-beruf">Beruf</span>
+      </div>
+      <div className="cr-header-meta">
+        {isMulti && (
+          <span className="cr-partner-badge">
+            <span className="cr-partner-dot"/>{partnerName}
+          </span>
+        )}
+        <span className="cr-round-badge">Runde {round} / 2</span>
+        {isRecording && amSpeaker && (
+          <span className="cr-rec-badge"><span className="cr-rec-dot"/>REC</span>
+        )}
+      </div>
+      <button
+        className={`cr-exit-btn${blockExit?" cr-exit-locked":""}`}
+        onClick={onExit}
+        disabled={blockExit}
+        aria-label={blockExit ? "Bitte warten" : "Beenden"}
+      >
+        {blockExit ? <LockIcon size={14}/> : <CloseIcon size={17}/>}
+      </button>
+    </header>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  MAIN COMPONENT
+// ════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
 export default function ChallengeRoom({
   mode        = "solo",
   roomId      = null,
@@ -494,573 +627,598 @@ export default function ChallengeRoom({
   onExit,
   heroBgImage = "/1000188762.png",
 }) {
-  const me      = currentUser || { uid: "demo", displayName: "Du" };
+  const me      = currentUser || { uid:"demo", displayName:"Du" };
   const isSolo  = mode === "solo";
   const isMulti = mode === "multi";
 
-  const [phase,             setPhase]             = useState("intro");
-  const [timerPhase,        setTimerPhase]        = useState("prep");
-  const [timeLeft,          setTimeLeft]          = useState(PREP_DURATION);
-  const [currentQ,          setCurrentQ]          = useState(null);
-  const [usedIds,           setUsedIds]           = useState([]);
-  const [round,             setRound]             = useState(1);
-  const [myRole,            setMyRole]            = useState("speaker");
-  const [partnerName,       setPartnerName]       = useState("Partner");
-  const [partnerUid,        setPartnerUid]        = useState(null);
-  const [sessionHistory,    setSessionHistory]    = useState([]);
-  const [showExitConfirm,   setShowExitConfirm]   = useState(false);
-  const [room,              setRoom]              = useState(null);
-  const [fbLoading,         setFbLoading]         = useState(isMulti);
-  const [phaseAnim,         setPhaseAnim]         = useState("in");
-
-  const [transcript,        setTranscript]        = useState("");
-  const [interimText,       setInterimText]       = useState("");
-  const [partnerTranscript, setPartnerTranscript] = useState(""); // FIX 3: final from Firebase
-  const [partnerInterim,    setPartnerInterim]    = useState(""); // FIX 3: interim from Firebase
-  const [isRecording,       setIsRecording]       = useState(false);
-
-  const [aiFeedback,        setAiFeedback]        = useState(null);
-  const [partnerAiFeedback, setPartnerAiFeedback] = useState(null);
-  const [aiFeedbackLoading, setAiFeedbackLoading] = useState(false);
-
-  // FIX 2: Turn state — uid of whoever's turn it is
-  const [currentTurn,      setCurrentTurn]       = useState(null);
-  // FIX 4: Remote analyzing flag (partner is analyzing → we show overlay too)
-  const [partnerAnalyzing, setPartnerAnalyzing]  = useState(false);
-
-  const timerRef      = useRef(null);
-  const startedAtRef  = useRef(null);
-  const transcriptRef = useRef("");
-  // Track partner uid in ref for callbacks
-  const partnerUidRef = useRef(null);
-
-  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
-  useEffect(() => { partnerUidRef.current = partnerUid; }, [partnerUid]);
-  useEffect(() => () => clearInterval(timerRef.current), []);
-
-  // ── Derived turn logic ───────────────────────────────────────────────────────
-  // FIX 2: mic is active only when it's this user's turn
-  const isMyTurn = isSolo || currentTurn === me.uid || currentTurn === null;
-
-  // ── FIX 1: Dedup-aware final handler ────────────────────────────────────────
-  const handleFinal = useCallback((rawChunk) => {
-    setTranscript(prev => {
-      const clean = sanitizeFinalChunk(prev, rawChunk);
-      if (!clean) return prev; // pure duplicate — discard
-      const updated = (prev + (prev ? " " : "") + clean).replace(/\s{2,}/g, " ").trim();
-      transcriptRef.current = updated;
-
-      // FIX 3: push confirmed final text to Firebase
-      if (isMulti && roomId) {
-        getFirebaseDB().then(db => {
-          if (!db) return;
-          import("firebase/database").then(({ ref, set }) =>
-            set(ref(db, `rooms/${roomId}/liveTranscript/${me.uid}/final`), updated));
-        });
-      }
-      return updated;
-    });
-    setInterimText("");
-  }, [isMulti, roomId, me.uid]);
-
-  const handleInterim = useCallback((text) => {
-    setInterimText(text);
-  }, []);
-
-  // FIX 3: Push interim to Firebase path for real-time partner view
-  const handleInterimSync = useCallback((text) => {
-    if (!isMulti || !roomId) return;
-    getFirebaseDB().then(db => {
-      if (!db) return;
-      import("firebase/database").then(({ ref, set }) =>
-        set(ref(db, `rooms/${roomId}/liveTranscript/${me.uid}/interim`), text));
-    });
-  }, [isMulti, roomId, me.uid]);
-
-  // FIX 2: mic is locked when it's not our turn OR we're the listener
-  const isSpeakerPhase   = phase === "speaking" && myRole === "speaker";
-  const micEffectivelyOn = isSpeakerPhase && isRecording && isMyTurn;
-
-  const { start: startRecog, stop: stopRecog } = useSpeechRecognition({
-    onInterim:     handleInterim,
-    onFinal:       handleFinal,
-    onInterimSync: handleInterimSync,
-    active:        micEffectivelyOn,
+  // ── roomState — SINGLE SOURCE OF TRUTH ───────────────────────────────────
+  // In solo:  managed locally.
+  // In multi: mirrored from Firebase onValue; NEVER set directly from UI code.
+  const [rs, setRs] = useState({
+    status:            "intro",
+    currentSpeaker:    me.uid,
+    timerPhase:        "prep",
+    timerEndsAt:       null,
+    currentQuestionId: null,
+    round:             1,
+    liveTranscript:    {},
+    analyzingFlags:    {},
+    aiFeedback:        {},
   });
 
-  useEffect(() => {
-    if (micEffectivelyOn) startRecog();
-    else { stopRecog(); setInterimText(""); }
-    return () => stopRecog();
-  }, [micEffectivelyOn]);
+  // ── Local-only UI state (no Firebase role) ────────────────────────────────
+  const [phaseAnim,       setPhaseAnim]       = useState("in");
+  const [showExitConfirm, setShowExitConfirm] = useState(false);
+  const [usedIds,         setUsedIds]         = useState([]);
+  const [isRecording,     setIsRecording]     = useState(false);
+  const [fbReady,         setFbReady]         = useState(!isMulti);
+  const [partnerName,     setPartnerName]     = useState("Partner");
+  const [partnerUid,      setPartnerUid]      = useState(null);
 
-  // ── Firebase helper ──────────────────────────────────────────────────────────
-  async function fbSet(path, value) {
-    if (!isMulti) return;
-    const db = await getFirebaseDB(); if (!db) return;
-    const { ref, set } = await import("firebase/database");
-    await set(ref(db, path), value);
-  }
+  // ── Stable refs ──────────────────────────────────────────────────────────
+  const transcriptRef  = useRef("");   // always current confirmed transcript
+  const partnerUidRef  = useRef(null);
+  const masterTimerRef = useRef(null); // Room Master's setInterval
+  const rsRef          = useRef(rs);   // current roomState for async callbacks
+  useEffect(() => { rsRef.current = rs; }, [rs]);
+  useEffect(() => { partnerUidRef.current = partnerUid; }, [partnerUid]);
 
-  // ── Firebase multiplayer listener ────────────────────────────────────────────
-  // FIX 3 + FIX 4: dual-path transcript sync + remote analyzing flag
+  // ── Cleanup ───────────────────────────────────────────────────────────────
+  useEffect(() => () => clearInterval(masterTimerRef.current), []);
+
+  // ── Derived ───────────────────────────────────────────────────────────────
+  const status      = rs.status;
+  const amSpeaker   = rs.currentSpeaker === me.uid;
+  const totalSec    = rs.timerPhase === "prep" ? PREP_SEC : SPEAK_SEC;
+  const isAnalyzing = !!(rs.analyzingFlags?.[me.uid] || rs.analyzingFlags?.[partnerUid]);
+  const blockExit   = isAnalyzing;
+
+  const myFeedback      = rs.aiFeedback?.[me.uid]      || null;
+  const pFeedback       = rs.aiFeedback?.[partnerUid]  || null;
+  const myFinal         = rs.liveTranscript?.[me.uid]?.final      || "";
+  const myInterim       = rs.liveTranscript?.[me.uid]?.interim    || "";
+  const partnerFinal    = rs.liveTranscript?.[partnerUid]?.final  || "";
+  const partnerInterim  = rs.liveTranscript?.[partnerUid]?.interim || "";
+  const currentQ        = questions.find(q => q.id === rs.currentQuestionId) || null;
+
+  // ── Timer display (pure read — no writes) ─────────────────────────────────
+  const timeLeft = useTimerDisplay(rs.timerEndsAt, totalSec);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Firebase roomState listener — multi only
+  // ─────────────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!isMulti || !roomId) return;
     let cleanup = () => {};
     (async () => {
-      const db = await getFirebaseDB();
-      if (!db) { setFbLoading(false); return; }
-      const { ref, onValue, off } = await import("firebase/database");
-      const roomRef = ref(db, `rooms/${roomId}`);
+      // Resolve partner name from players map (separate path, written by matchmaking)
+      const unsubPlayers = await fbListen(`rooms/${roomId}/players`, (players) => {
+        if (!players) return;
+        const amA = players.A?.uid === me.uid;
+        const p   = amA ? players.B : players.A;
+        if (p?.displayName) setPartnerName(p.displayName);
+        if (p?.uid)         setPartnerUid(p.uid);
+      });
 
-      onValue(roomRef, snap => {
-        const data = snap.val();
-        setFbLoading(false);
+      // Main roomState listener — updates rs and triggers Room Master timer
+      const unsubRS = await fbListen(`rooms/${roomId}/roomState`, (data) => {
+        setFbReady(true);
         if (!data) return;
-        setRoom(data);
 
-        // Determine my role and partner
-        const amA = data.players?.A?.uid === me.uid;
-        const myPlayer      = amA ? data.players.A : data.players?.B;
-        const partnerPlayer = amA ? data.players?.B : data.players?.A;
+        setRs(prev => {
+          const next = { ...prev, ...data };
+          return next;
+        });
 
-        if (myPlayer?.role)              setMyRole(myPlayer.role);
-        if (partnerPlayer?.displayName)  setPartnerName(partnerPlayer.displayName);
-        if (partnerPlayer?.uid) {
-          setPartnerUid(partnerPlayer.uid);
-          partnerUidRef.current = partnerPlayer.uid;
-        }
-
-        setRound(data.round || 1);
-
-        if (data.currentQuestionId && questions.length) {
-          const q = questions.find(q => q.id === data.currentQuestionId);
-          if (q) setCurrentQ(q);
-        }
-
-        if (data.status) setPhase(data.status);
-
-        if (data.timer?.startedAt && data.timer?.state === "running") {
-          const elapsed = Math.floor((Date.now() - data.timer.startedAt) / 1000);
-          setTimerPhase(data.timer.phase || "prep");
-          setTimeLeft(Math.max(0, data.timer.durationSec - elapsed));
-        }
-
-        // FIX 2: sync currentTurn
-        if (data.currentTurn !== undefined) {
-          setCurrentTurn(data.currentTurn);
-        }
-
-        // FIX 3: read partner final + interim from dual paths
-        if (data.liveTranscript && partnerPlayer?.uid) {
-          const pt = data.liveTranscript[partnerPlayer.uid];
-          setPartnerTranscript(pt?.final   || "");
-          setPartnerInterim   (pt?.interim || "");
-        }
-
-        // FIX 4: detect partner's analyzing flag
-        if (data.analyzingFlags) {
-          const pFlag = partnerPlayer?.uid ? data.analyzingFlags[partnerPlayer.uid] : false;
-          setPartnerAnalyzing(!!pFlag);
-        }
-
-        if (data.aiFeedback) {
-          const myFb = data.aiFeedback[me.uid];
-          const pFb  = data.aiFeedback[partnerPlayer?.uid];
-          if (myFb) setAiFeedback(myFb);
-          if (pFb)  setPartnerAiFeedback(pFb);
+        // Room Master: start/restart master countdown when timerEndsAt changes
+        // and we are the currentSpeaker.
+        if (data.currentSpeaker === me.uid && data.timerEndsAt) {
+          startMasterCountdown(data.timerEndsAt, data.timerPhase);
+        } else {
+          // Not the master — stop any stale master interval
+          clearInterval(masterTimerRef.current);
         }
       });
-      cleanup = () => off(roomRef);
+
+      cleanup = () => { unsubPlayers(); unsubRS(); };
     })();
     return () => cleanup();
   }, [isMulti, roomId]);
 
-  // ── Phase transition (animated) ──────────────────────────────────────────────
-  function transitionPhase(newPhase) {
-    setPhaseAnim("out");
-    setTimeout(() => { setPhase(newPhase); setPhaseAnim("in"); }, 240);
-  }
+  // ─────────────────────────────────────────────────────────────────────────
+  // Firebase write helper for roomState
+  // ─────────────────────────────────────────────────────────────────────────
+  const rsPath = roomId ? `rooms/${roomId}/roomState` : null;
 
-  // FIX 4: block exit while ANY analyzing is happening
-  const anyAnalyzing = aiFeedbackLoading || partnerAnalyzing;
+  /**
+   * pushRS — write a partial update to roomState.
+   * Multi: writes to Firebase → reflected via onValue listener.
+   * Solo:  updates local state directly.
+   */
+  const pushRS = useCallback(async (partial) => {
+    if (isMulti && rsPath) {
+      await fbUpdate(rsPath, partial);
+      // Local state is updated via the listener — do NOT call setRs here.
+    } else {
+      setRs(prev => ({ ...prev, ...partial }));
+    }
+  }, [isMulti, rsPath]);
 
-  function handleExitRequest() {
-    if (anyAnalyzing) return;
-    if (phase === "intro" || phase === "finished") { onExit?.(); return; }
-    setShowExitConfirm(true);
-  }
+  /** Push a value to a specific sub-path within roomState */
+  const pushRSPath = useCallback(async (subPath, value) => {
+    if (isMulti && rsPath) {
+      await fbSet(`${rsPath}/${subPath}`, value);
+    } else {
+      // Solo: interpret subPath (e.g. "liveTranscript/uid/final") and merge
+      const keys = subPath.split("/");
+      setRs(prev => {
+        const next = JSON.parse(JSON.stringify(prev)); // deep clone
+        let cursor = next;
+        for (let i = 0; i < keys.length - 1; i++) {
+          if (!cursor[keys[i]]) cursor[keys[i]] = {};
+          cursor = cursor[keys[i]];
+        }
+        cursor[keys[keys.length - 1]] = value;
+        return next;
+      });
+    }
+  }, [isMulti, rsPath]);
 
-  function startLocalTimer(duration, onComplete) {
-    clearInterval(timerRef.current);
-    startedAtRef.current = Date.now();
-    timerRef.current = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startedAtRef.current) / 1000);
-      const left    = Math.max(0, duration - elapsed);
-      setTimeLeft(left);
-      if (left === 0) { clearInterval(timerRef.current); onComplete(); }
+  // ─────────────────────────────────────────────────────────────────────────
+  // Room Master countdown — writes timerEndsAt once at phase start.
+  // Fires the phase-transition callback when countdown reaches 0.
+  // ─────────────────────────────────────────────────────────────────────────
+  function startMasterCountdown(endsAt, timerPhase) {
+    clearInterval(masterTimerRef.current);
+    masterTimerRef.current = setInterval(() => {
+      const left = Math.max(0, Math.round((endsAt - Date.now()) / 1000));
+      if (left <= 0) {
+        clearInterval(masterTimerRef.current);
+        if (timerPhase === "prep") {
+          // Prep ended — begin speaking
+          const q = questions.find(q => q.id === rsRef.current.currentQuestionId);
+          if (q) beginSpeaking(q);
+        } else {
+          // Speak ended
+          handleSpeakEnd();
+        }
+      }
     }, 500);
   }
 
-  function beginPrep(questionOverride) {
-    setTranscript(""); setInterimText(""); setAiFeedback(null);
-    setPartnerTranscript(""); setPartnerInterim("");
-    const q = questionOverride || pickRandom(questions, usedIds);
-    setCurrentQ(q); setUsedIds(prev => [...prev, q.id]);
-    setTimerPhase("prep"); setTimeLeft(PREP_DURATION);
-    transitionPhase("prep");
-    startLocalTimer(PREP_DURATION, () => beginSpeaking(q));
-    if (isMulti) {
-      fbSet(`rooms/${roomId}`, {
-        ...room,
-        status: "prep",
-        currentQuestionId: q.id,
-        round,
-        currentTurn: me.uid, // FIX 2: speaker's turn starts with prep
-        timer: { startedAt: Date.now(), durationSec: PREP_DURATION, phase: "prep", state: "running" },
-      });
-    }
+  // ─────────────────────────────────────────────────────────────────────────
+  // Transcript push helpers
+  // ─────────────────────────────────────────────────────────────────────────
+  const pushTranscriptField = useCallback((field, value) => {
+    pushRSPath(`liveTranscript/${me.uid}/${field}`, value);
+  }, [pushRSPath, me.uid]);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Speech recognition handlers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * handleFinal — v5 dedup via transcriptRef (always current).
+   * isFinal STRICTLY gated — this is never called with interim text.
+   */
+  const handleFinal = useCallback((rawChunk) => {
+    const existing = transcriptRef.current;
+    const clean    = sanitizeFinalChunk(existing, rawChunk);
+    if (!clean) return; // duplicate — discard
+
+    const updated = (existing + (existing ? " " : "") + clean)
+      .replace(/\s{2,}/g, " ").trim();
+
+    transcriptRef.current = updated;
+    pushTranscriptField("final",   updated);
+    pushTranscriptField("interim", "");
+  }, [pushTranscriptField]);
+
+  const handleInterim = useCallback((text) => {
+    // Only push to Firebase for partner display; does NOT touch transcriptRef
+    pushTranscriptField("interim", text);
+  }, [pushTranscriptField]);
+
+  const handleInterimSync = useCallback((_text) => {
+    // Already handled inside handleInterim — no-op here to keep hook signature
+  }, []);
+
+  // Mic is active only when: speaking, it's our turn, and recording is on
+  const micActive = status === "speaking" && amSpeaker && isRecording;
+
+  const { start: startRecog, stop: stopRecog } = useSpeechRecognition({
+    onFinal:       handleFinal,
+    onInterim:     handleInterim,
+    onInterimSync: handleInterimSync,
+    active:        micActive,
+  });
+
+  useEffect(() => {
+    if (micActive) startRecog();
+    else { stopRecog(); }
+    return () => stopRecog();
+  }, [micActive]);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase animation helper
+  // ─────────────────────────────────────────────────────────────────────────
+  function animTransition() {
+    setPhaseAnim("out");
+    setTimeout(() => setPhaseAnim("in"), 220);
   }
 
-  function beginSpeaking(q) {
-    clearInterval(timerRef.current);
-    setTimerPhase("speak"); setTimeLeft(SPEAK_DURATION); setIsRecording(true);
-    playBeep({ freq: 660, gain: .4 });
-    transitionPhase("speaking");
-    startLocalTimer(SPEAK_DURATION, handleSpeakEnd);
-    if (isMulti) {
-      fbSet(`rooms/${roomId}/status`, "speaking");
-      fbSet(`rooms/${roomId}/currentTurn`, me.uid); // FIX 2: confirm it's speaker's turn
-      fbSet(`rooms/${roomId}/timer`, {
-        startedAt: Date.now(), durationSec: SPEAK_DURATION, phase: "speak", state: "running",
-      });
-    }
+  function handleExitRequest() {
+    if (blockExit) return;
+    if (status === "intro" || status === "finished") { onExit?.(); return; }
+    setShowExitConfirm(true);
   }
 
-  // FIX 2 + FIX 4: On speak end:
-  //   1. Set analyzing flag in Firebase BEFORE AI call (both users see overlay)
-  //   2. Set currentTurn to partner uid (listener's turn begins)
-  //   3. Fetch AI feedback
-  //   4. Clear analyzing flag when done
+  // ─────────────────────────────────────────────────────────────────────────
+  // Game flow
+  // All state changes → pushRS → Firebase → listener → setRs
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Phase 1: Prep */
+  async function beginPrep(questionOverride) {
+    // Guard: only Room Master (amSpeaker) in multi; always in solo
+    if (isMulti && !amSpeaker) return;
+
+    transcriptRef.current = "";
+    const q       = questionOverride || pickRandom(questions, usedIds);
+    const endsAt  = Date.now() + PREP_SEC * 1000;
+
+    setUsedIds(prev => [...prev, q.id]);
+
+    await pushRS({
+      status:            "prep",
+      currentSpeaker:    me.uid,
+      timerPhase:        "prep",
+      timerEndsAt:       endsAt,
+      currentQuestionId: q.id,
+      liveTranscript:    {},
+      analyzingFlags:    {},
+    });
+
+    // In solo, start master countdown locally (no listener)
+    if (isSolo) startMasterCountdown(endsAt, "prep");
+    animTransition();
+  }
+
+  /** Phase 2: Speaking */
+  async function beginSpeaking(q) {
+    if (isMulti && !amSpeaker) return;
+    clearInterval(masterTimerRef.current);
+
+    setIsRecording(true);
+    playBeep({ freq:660, gain:.4 });
+
+    const endsAt = Date.now() + SPEAK_SEC * 1000;
+
+    await pushRS({
+      status:      "speaking",
+      timerPhase:  "speak",
+      timerEndsAt: endsAt,
+    });
+
+    if (isSolo) startMasterCountdown(endsAt, "speak");
+    animTransition();
+  }
+
+  /** Phase 3: Speak end → analyzing */
   async function handleSpeakEnd() {
-    clearInterval(timerRef.current);
-    setIsRecording(false); stopRecog();
-    playBeep({ freq: 440, gain: .3 });
+    if (isMulti && !amSpeaker) return;
+    clearInterval(masterTimerRef.current);
+    setIsRecording(false);
+    stopRecog();
+    playBeep({ freq:440, gain:.3 });
+
     const finalTranscript = transcriptRef.current;
 
-    // Clear interim from Firebase
-    if (isMulti && roomId) {
-      fbSet(`rooms/${roomId}/liveTranscript/${me.uid}/interim`, "");
-    }
+    // Mark this uid as analyzing (overlay shows for ALL users via Firebase)
+    await pushRS({
+      status:         "analyzing",
+      timerEndsAt:    null,
+      analyzingFlags: { ...(rsRef.current.analyzingFlags || {}), [me.uid]: true },
+      liveTranscript: {
+        ...(rsRef.current.liveTranscript || {}),
+        [me.uid]: { final: finalTranscript, interim: "" },
+      },
+    });
 
-    // FIX 4: Set analyzing flag for BOTH users to see
-    setAiFeedbackLoading(true);
-    if (isMulti && roomId) {
-      fbSet(`rooms/${roomId}/analyzingFlags/${me.uid}`, true);
-    }
-
-    // FIX 2: Transfer turn to partner NOW (speaker is done)
-    const pUid = partnerUidRef.current;
-    if (isMulti && roomId && pUid) {
-      fbSet(`rooms/${roomId}/currentTurn`, pUid);
-    }
-
-    transitionPhase("selfAssess");
+    animTransition();
 
     try {
       const result = await fetchAIFeedback(finalTranscript);
-      setAiFeedback(result);
-      if (isMulti && roomId && result) {
-        fbSet(`rooms/${roomId}/aiFeedback/${me.uid}`, { ...result, transcript: finalTranscript });
+      if (result) {
+        await pushRS({
+          aiFeedback: {
+            ...(rsRef.current.aiFeedback || {}),
+            [me.uid]: { ...result, transcript: finalTranscript },
+          },
+        });
       }
     } catch (err) {
-      console.error("AI feedback error:", err);
+      console.error("AI error:", err);
     } finally {
-      // FIX 4: Clear analyzing flag — overlay disappears for both users
-      setAiFeedbackLoading(false);
-      if (isMulti && roomId) {
-        fbSet(`rooms/${roomId}/analyzingFlags/${me.uid}`, false);
-      }
+      // Clear analyzing flag — overlay disappears for everyone
+      await pushRS({
+        analyzingFlags: { ...(rsRef.current.analyzingFlags || {}), [me.uid]: false },
+      });
     }
   }
 
-  const totalTime = timerPhase === "prep" ? PREP_DURATION : SPEAK_DURATION;
+  /** Phase 4: Continue from review screen */
+  async function handleContinue() {
+    if (isSolo || rs.round >= 2) {
+      await pushRS({ status:"finished" });
+    } else {
+      // Transfer speaker role to partner for round 2
+      const nextSpeaker = partnerUidRef.current || me.uid;
+      await pushRS({
+        status:         "switching",
+        round:          rs.round + 1,
+        currentSpeaker: nextSpeaker,
+      });
+    }
+    animTransition();
+  }
 
+  /** Phase: Switch — new Room Master starts their prep */
+  async function handleSwitchStart() {
+    // Only the new speaker (who is now amSpeaker after pushRS set currentSpeaker) calls this
+    await beginPrep();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Render
+  // ─────────────────────────────────────────────────────────────────────────
   return (
     <>
       <style>{CSS}</style>
-      <link rel="preconnect" href="https://fonts.googleapis.com" />
-      <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-      <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet" />
+      <link rel="preconnect" href="https://fonts.googleapis.com"/>
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous"/>
+      <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet"/>
 
       <div className="cr-root">
-        <div className="cr-bg-dim" />
+        <div className="cr-bg-dim"/>
 
-        {/* FIX 4: Overlay visible when local OR remote user is analyzing */}
-        {anyAnalyzing && <AIAnalyzingOverlay />}
+        {/* Global AI overlay — blocks all interaction for both users */}
+        {isAnalyzing && <AIAnalyzingOverlay/>}
 
-        {showExitConfirm && !anyAnalyzing && (
-          <ExitConfirmModal
+        {showExitConfirm && !blockExit && (
+          <ExitModal
             onConfirm={() => { setShowExitConfirm(false); onExit?.(); }}
             onCancel={() => setShowExitConfirm(false)}
           />
         )}
 
-        {/* ── INTRO ───────────────────────────────────────────────────────── */}
-        {phase === "intro" && (
-          <div className="cr-intro-stage">
-            <div className="cr-hero-bg" style={{ backgroundImage: `url(${heroBgImage})` }} />
-            <div className="cr-hero-overlay-top" /><div className="cr-hero-overlay-bottom" />
-            <header className="cr-header cr-header-hero">
-              <div className="cr-logo">
-                <span className="cr-logo-b2">B2</span><span className="cr-logo-beruf">Beruf</span>
-              </div>
-              <div className="cr-header-meta">
-                {isMulti && <span className="cr-partner-badge"><span className="cr-partner-dot" />{partnerName}</span>}
-                <span className="cr-round-badge">Runde {round} / 2</span>
-              </div>
-              <button className="cr-exit-btn" onClick={handleExitRequest} aria-label="Beenden">
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
-                  <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                </svg>
-              </button>
-            </header>
+        {/* ── INTRO ──────────────────────────────────────────────────── */}
+        {status === "intro" && (
+          <div className="cr-intro">
+            <div className="cr-hero-bg" style={{ backgroundImage:`url(${heroBgImage})` }}/>
+            <div className="cr-hero-top"/><div className="cr-hero-bot"/>
+            <Header round={rs.round} partnerName={partnerName} isMulti={isMulti}
+              blockExit={blockExit} onExit={handleExitRequest}
+              isRecording={false} amSpeaker={amSpeaker}/>
             <div className="cr-hero-content">
               <div className="cr-hero-eyebrow">Deutschprüfung B2 · Mündliche Kommunikation</div>
-              <h1 className="cr-hero-title">Bereit für<br /><span className="cr-hero-title-accent">deine Prüfung?</span></h1>
+              <h1 className="cr-hero-title">
+                Bereit für<br/><span className="cr-hero-accent">deine Prüfung?</span>
+              </h1>
               <p className="cr-hero-sub">
-                {isSolo ? "Solo-Übung · 30 s Vorbereitung · 3 min Sprechen · KI-Feedback"
-                        : `Duell mit ${partnerName} · 2 Runden · Live-Transkript · KI-Auswertung`}
+                {isSolo
+                  ? "Solo-Übung · 30 s Vorbereitung · 3 min Sprechen · KI-Feedback"
+                  : `Duell mit ${partnerName} · 2 Runden · Live-Transkript · KI-Auswertung`}
               </p>
               <div className="cr-hero-meta-row">
-                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">⏱</span><span>30 s Vorbereitung</span></div>
-                <div className="cr-hero-meta-divider" />
-                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">🎙</span><span>3 min Sprechen</span></div>
-                <div className="cr-hero-meta-divider" />
-                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">🤖</span><span>KI-Auswertung</span></div>
-                <div className="cr-hero-meta-divider" />
-                <div className="cr-hero-meta-item"><span className="cr-hero-meta-icon">📋</span><span>Redemittel</span></div>
+                {[["⏱","30 s Vorbereitung"],["🎙","3 min Sprechen"],["🤖","KI-Auswertung"],["📋","Redemittel"]]
+                  .map(([icon,label],i,arr) => (
+                    <span key={i} style={{ display:"contents" }}>
+                      <div className="cr-hero-meta-item"><span>{icon}</span><span>{label}</span></div>
+                      {i < arr.length-1 && <div className="cr-hero-meta-div"/>}
+                    </span>
+                  ))}
               </div>
-              <button className="cr-hero-start-btn" onClick={() => beginPrep()}>
-                <span>Übung starten</span>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                  <path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
+              {(!isMulti || fbReady) ? (
+                <button className="cr-hero-btn" onClick={() => beginPrep()}>
+                  <span>Übung starten</span>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                    <path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </button>
+              ) : (
+                <p className="cr-hero-sub" style={{ marginTop:24, color:"var(--acc)" }}>
+                  Verbinde mit Raum…
+                </p>
+              )}
             </div>
           </div>
         )}
 
-        {/* ── ALL OTHER PHASES ────────────────────────────────────────────── */}
-        {phase !== "intro" && (
+        {/* ── ALL NON-INTRO PHASES ────────────────────────────────────── */}
+        {status !== "intro" && (
           <>
-            <header className="cr-header">
-              <div className="cr-logo">
-                <span className="cr-logo-b2">B2</span><span className="cr-logo-beruf">Beruf</span>
-              </div>
-              <div className="cr-header-meta">
-                {isMulti && <span className="cr-partner-badge"><span className="cr-partner-dot" />{partnerName}</span>}
-                <span className="cr-round-badge">Runde {round} / 2</span>
-                {isRecording && isMyTurn && (
-                  <span className="cr-recording-badge"><span className="cr-recording-dot" />REC</span>
-                )}
-              </div>
-              {/* FIX 4: disabled + lock icon while ANY analyzing */}
-              <button
-                className={`cr-exit-btn${anyAnalyzing ? " cr-exit-btn-locked" : ""}`}
-                onClick={handleExitRequest}
-                disabled={anyAnalyzing}
-                aria-label={anyAnalyzing ? "Bitte warten" : "Beenden"}
-                title={anyAnalyzing ? "Warte auf KI-Analyse…" : undefined}
-              >
-                {anyAnalyzing
-                  ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                      <rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" strokeWidth="2" />
-                      <path d="M7 11V7a5 5 0 0110 0v4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                    </svg>
-                  : <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
-                      <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                    </svg>
-                }
-              </button>
-            </header>
+            <Header round={rs.round} partnerName={partnerName} isMulti={isMulti}
+              blockExit={blockExit} onExit={handleExitRequest}
+              isRecording={isRecording} amSpeaker={amSpeaker}/>
 
-            <main className={`cr-main cr-phase-${phaseAnim}`}>
+            <main className={`cr-main cr-main-${phaseAnim}`}>
 
               {/* PREP / SPEAKING */}
-              {(phase === "prep" || phase === "speaking") && currentQ && (
-                <div className="cr-game-layout">
+              {(status === "prep" || status === "speaking") && currentQ && (
+                <div className="cr-game">
+                  {/* ── Timer column ── */}
                   <div className="cr-timer-col">
-                    <CircularTimer timeLeft={timeLeft} totalTime={totalTime} phase={timerPhase} />
-                    <div className={`cr-phase-pill cr-phase-pill-${timerPhase}`}>
-                      {timerPhase === "prep" ? "Vorbereitung" : "Sprechen"}
+                    <CircularTimer timeLeft={timeLeft} totalTime={totalSec} phase={rs.timerPhase}/>
+                    <div className={`cr-phase-pill cr-phase-pill-${rs.timerPhase}`}>
+                      {rs.timerPhase === "prep" ? "Vorbereitung" : "Sprechen"}
                     </div>
-                    {phase === "prep" && (
-                      <button className="cr-skip-btn" onClick={() => beginSpeaking(currentQ)}>
+
+                    {/* Skip prep — only Room Master */}
+                    {status === "prep" && amSpeaker && (
+                      <button className="cr-skip" onClick={() => beginSpeaking(currentQ)}>
                         Jetzt sprechen →
                       </button>
                     )}
-                    {/* FIX 2: Turn indicator in multi mode */}
-                    {isMulti && <TurnIndicatorBadge isMyTurn={isMyTurn} partnerName={partnerName} />}
-                    {isMulti && <div className="cr-role-badge">{myRole === "speaker" ? "🎙 Sprecher" : "👂 Zuhörer"}</div>}
 
-                    {/* FIX 2: Mic button locked when not user's turn */}
-                    {phase === "speaking" && myRole === "speaker" && (
+                    {isMulti && <TurnBadge mine={amSpeaker} partnerName={partnerName}/>}
+                    {isMulti && (
+                      <div className="cr-role-badge">
+                        {amSpeaker ? "🎙 Sprecher" : "👂 Zuhörer"}
+                      </div>
+                    )}
+
+                    {/* Mic button — locked when NOT Room Master */}
+                    {status === "speaking" && amSpeaker && (
                       <button
-                        className={`cr-mic-toggle${isRecording && isMyTurn ? " cr-mic-active" : ""}${!isMyTurn ? " cr-mic-locked" : ""}`}
-                        onClick={() => { if (isMyTurn) setIsRecording(r => !r); }}
-                        disabled={!isMyTurn}
-                        title={!isMyTurn ? "Warte auf deinen Turn…" : isRecording ? "Mikrofon stummschalten" : "Mikrofon aktivieren"}
-                        aria-label={!isMyTurn ? "Gesperrt — nicht dein Turn" : isRecording ? "Stummschalten" : "Aktivieren"}
+                        className={`cr-mic${isRecording?" cr-mic-on":""}`}
+                        onClick={() => setIsRecording(r => !r)}
+                        title={isRecording ? "Stumm" : "Aktivieren"}
                       >
-                        {isRecording && isMyTurn
-                          ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                              <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" fill="currentColor" />
-                              <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                            </svg>
-                          : !isMyTurn
-                            ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                <rect x="3" y="11" width="18" height="11" rx="2" stroke="currentColor" strokeWidth="2" />
-                                <path d="M7 11V7a5 5 0 0110 0v4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                              </svg>
-                            : <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                                <line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-                                <path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2a7 7 0 01-.11 1.23M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                              </svg>
-                        }
-                        <span>
-                          {!isMyTurn ? "Gesperrt" : isRecording ? "Aktiv" : "Stumm"}
-                        </span>
+                        {isRecording ? <MicOnIcon/> : <MicOffIcon/>}
+                        <span>{isRecording ? "Aktiv" : "Stumm"}</span>
                       </button>
+                    )}
+
+                    {/* Listener indicator */}
+                    {status === "speaking" && !amSpeaker && isMulti && (
+                      <div className="cr-listening-badge">
+                        <span className="cr-listening-dot"/>Zuhören…
+                      </div>
+                    )}
+
+                    {/* Listener locked mic (visual only — no onClick) */}
+                    {status === "speaking" && !amSpeaker && isMulti && (
+                      <div className="cr-mic cr-mic-locked" aria-disabled="true">
+                        <LockIcon size={14}/>
+                        <span>Gesperrt</span>
+                      </div>
                     )}
                   </div>
 
+                  {/* ── Card column ── */}
                   <div className="cr-card-col">
                     <div className="cr-topic-chip">{currentQ.topic || "Thema"}</div>
-                    <div className="cr-question-card">
-                      <div className="cr-question-number">Aufgabe</div>
-                      <p className="cr-question-text">{currentQ.question}</p>
+                    <div className="cr-q-card">
+                      <div className="cr-q-num">Aufgabe</div>
+                      <p className="cr-q-text">{currentQ.question}</p>
                     </div>
-                    <RedemittelPanel items={currentQ.redemittel} />
-                    {phase === "speaking" && (
+                    <RedemittelPanel items={currentQ.redemittel}/>
+                    {status === "speaking" && (
                       <LiveTranscriptBox
-                        transcript={transcript}
-                        interimText={interimText}
-                        partnerTranscript={partnerTranscript}
+                        myFinal={myFinal}
+                        myInterim={myInterim}
+                        partnerFinal={partnerFinal}
                         partnerInterim={partnerInterim}
+                        isSpeaker={amSpeaker}
                         isMulti={isMulti}
-                        isSpeaker={myRole === "speaker"}
                       />
                     )}
                   </div>
                 </div>
               )}
 
-              {/* SELF ASSESS */}
-              {phase === "selfAssess" && currentQ && (
-                <div className="cr-center-stage">
+              {/* ANALYZING */}
+              {status === "analyzing" && (
+                <div className="cr-center">
                   <div className="cr-assess-wide">
-                    <div className="cr-assess-header">
-                      <div className="cr-assess-icon">✍️</div>
-                      <h2 className="cr-assess-heading">Auswertung</h2>
-                      <p className="cr-assess-sub">Deine KI-gestützte Sprachanalyse</p>
+                    <div className="cr-assess-hdr">
+                      <div className="cr-assess-icon-lbl">✍️</div>
+                      <h2 className="cr-assess-h">Auswertung</h2>
+                      <p className="cr-assess-sub">KI-gestützte Sprachanalyse</p>
                     </div>
-                    {/* FIX 4: Show overlay instead of inline spinner — handled above.
-                        AIFeedbackCard is still shown once data arrives. */}
-                    <AIFeedbackCard feedback={aiFeedback} transcript={transcript} isLoading={aiFeedbackLoading} />
-                    {isMulti && partnerAiFeedback && (
-                      <div className="cr-partner-feedback-wrap">
-                        <div className="cr-partner-feedback-label">🤝 {partnerName}s Auswertung</div>
-                        <AIFeedbackCard feedback={partnerAiFeedback} transcript={partnerAiFeedback.transcript} isLoading={false} />
+                    <AIFeedbackCard feedback={myFeedback} transcript={myFinal} isLoading={!myFeedback}/>
+                    {isMulti && pFeedback && (
+                      <div className="cr-pfb-wrap">
+                        <div className="cr-pfb-label">🤝 {partnerName}s Auswertung</div>
+                        <AIFeedbackCard feedback={pFeedback} transcript={pFeedback.transcript} isLoading={false}/>
                       </div>
                     )}
-                    <div className="cr-assess-card cr-assess-card-notes">
-                      <p className="cr-assess-notes-label">Eigene Notizen (optional)</p>
-                      <textarea className="cr-assess-textarea" placeholder="Notizen auf Deutsch …" rows={3} />
-                      <button
-                        className="cr-primary-btn"
-                        style={{ marginTop: 8, alignSelf: "flex-end" }}
-                        disabled={anyAnalyzing}
-                        onClick={() => {
-                          const result = scoreAnswer(transcript, currentQ.redemittel || []);
-                          setSessionHistory(h => [...h, { q: currentQ, result, aiFeedback }]);
-                          if (isSolo || round >= 2) transitionPhase("finished");
-                          else                      transitionPhase("switching");
-                        }}
-                      >
-                        {isSolo || round >= 2 ? "Zur Abschlussbewertung →" : "Nächste Runde →"}
-                      </button>
-                    </div>
+                    {myFeedback && (
+                      <div className="cr-assess-card">
+                        <p className="cr-assess-note-lbl">Eigene Notizen (optional)</p>
+                        <textarea className="cr-assess-ta" placeholder="Notizen auf Deutsch …" rows={3}/>
+                        <button
+                          className="cr-primary-btn"
+                          style={{ alignSelf:"flex-end" }}
+                          disabled={isAnalyzing}
+                          onClick={handleContinue}
+                        >
+                          {isSolo || rs.round >= 2 ? "Zur Abschlussbewertung →" : "Nächste Runde →"}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
 
               {/* SWITCHING */}
-              {phase === "switching" && (
-                <div className="cr-center-stage">
+              {status === "switching" && (
+                <div className="cr-center">
                   <div className="cr-switch-card">
-                    <div className="cr-switch-icon-wrap">
+                    <div className="cr-switch-icon">
                       <svg width="32" height="32" viewBox="0 0 24 24" fill="none">
                         <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"
-                          stroke="#4f9eff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                          stroke="#4f9eff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
                       </svg>
                     </div>
                     <h2 className="cr-switch-title">Rollenwechsel</h2>
-                    <p className="cr-switch-sub">Du bist jetzt: <strong>{myRole === "speaker" ? "Zuhörer" : "Sprecher"}</strong></p>
-                    <button className="cr-primary-btn" onClick={() => {
-                      setRound(r => r + 1); beginPrep();
-                      fbSet(`rooms/${roomId}/round`, round + 1);
-                    }}>Nächste Runde →</button>
+                    <p className="cr-switch-sub">
+                      Runde {rs.round} · Nächster Sprecher:&nbsp;
+                      <strong>{amSpeaker ? "Du" : partnerName}</strong>
+                    </p>
+                    {amSpeaker ? (
+                      <button className="cr-primary-btn" onClick={handleSwitchStart}>
+                        Runde {rs.round} starten →
+                      </button>
+                    ) : (
+                      <p className="cr-switch-wait">Warte auf {partnerName}…</p>
+                    )}
                   </div>
                 </div>
               )}
 
               {/* FINISHED */}
-              {phase === "finished" && (
-                <div className="cr-center-stage">
+              {status === "finished" && (
+                <div className="cr-center">
                   <div className="cr-finish-wide">
                     <div className="cr-finish-card">
-                      <div className="cr-finish-confetti">🏆</div>
+                      <div className="cr-finish-trophy">🏆</div>
                       <h1 className="cr-finish-title">Geschafft!</h1>
                       <p className="cr-finish-sub">Hervorragende Arbeit!</p>
-                      {aiFeedback && (
-                        <div className="cr-finish-summary">
-                          <div className="cr-finish-score-wrap">
-                            <svg viewBox="0 0 120 120" width="130" height="130">
-                              <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(79,158,255,.1)" strokeWidth="10" />
-                              <circle cx="60" cy="60" r="52" fill="none" stroke="#4f9eff" strokeWidth="10" strokeLinecap="round"
-                                strokeDasharray={`${2 * Math.PI * 52}`}
-                                strokeDashoffset={`${2 * Math.PI * 52 * (1 - (aiFeedback.score || 0) / 5)}`}
-                                transform="rotate(-90 60 60)"
-                                style={{ transition: "stroke-dashoffset 1s ease" }} />
-                              <text x="60" y="56" textAnchor="middle" dominantBaseline="middle"
-                                fill="#fff" fontSize="28" fontWeight="700" fontFamily="Syne,sans-serif">{aiFeedback.score}</text>
-                              <text x="60" y="76" textAnchor="middle" dominantBaseline="middle"
-                                fill="rgba(255,255,255,.4)" fontSize="10" fontFamily="Syne,sans-serif">VON 5</text>
-                            </svg>
-                          </div>
-                          {aiFeedback.feedback && <p className="cr-finish-feedback-text">{aiFeedback.feedback}</p>}
+                      {myFeedback && (
+                        <div className="cr-finish-score">
+                          <svg viewBox="0 0 120 120" width="130" height="130">
+                            <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(79,158,255,.1)" strokeWidth="10"/>
+                            <circle cx="60" cy="60" r="52" fill="none" stroke="#4f9eff" strokeWidth="10"
+                              strokeLinecap="round"
+                              strokeDasharray={`${2*Math.PI*52}`}
+                              strokeDashoffset={`${2*Math.PI*52*(1-(myFeedback.score||0)/5)}`}
+                              transform="rotate(-90 60 60)"
+                              style={{ transition:"stroke-dashoffset 1.2s ease" }}/>
+                            <text x="60" y="56" textAnchor="middle" dominantBaseline="middle"
+                              fill="#fff" fontSize="28" fontWeight="700" fontFamily="Syne">{myFeedback.score}</text>
+                            <text x="60" y="76" textAnchor="middle" dominantBaseline="middle"
+                              fill="rgba(255,255,255,.4)" fontSize="10" fontFamily="Syne">VON 5</text>
+                          </svg>
+                          {myFeedback.feedback && <p className="cr-finish-fb">{myFeedback.feedback}</p>}
                         </div>
                       )}
-                      {/* FIX 4: exit button disabled while analyzing */}
-                      <button
-                        className="cr-primary-btn cr-finish-btn"
-                        disabled={anyAnalyzing}
-                        onClick={() => onExit?.()}
-                      >
+                      <button className="cr-primary-btn cr-finish-btn" onClick={() => onExit?.()}>
                         Beenden
                       </button>
                     </div>
-                    {aiFeedback && <AIFeedbackCard feedback={aiFeedback} transcript={transcript} isLoading={false} />}
-                    {isMulti && partnerAiFeedback && (
-                      <div className="cr-partner-feedback-wrap">
-                        <div className="cr-partner-feedback-label">🤝 {partnerName}s Auswertung</div>
-                        <AIFeedbackCard feedback={partnerAiFeedback} transcript={partnerAiFeedback.transcript} isLoading={false} />
+                    {myFeedback && <AIFeedbackCard feedback={myFeedback} transcript={myFinal} isLoading={false}/>}
+                    {isMulti && pFeedback && (
+                      <div className="cr-pfb-wrap">
+                        <div className="cr-pfb-label">🤝 {partnerName}s Auswertung</div>
+                        <AIFeedbackCard feedback={pFeedback} transcript={pFeedback.transcript} isLoading={false}/>
                       </div>
                     )}
                   </div>
                 </div>
               )}
+
             </main>
           </>
         )}
@@ -1069,424 +1227,263 @@ export default function ChallengeRoom({
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Styles
+// ─────────────────────────────────────────────────────────────────────────────
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap');
 
-  .cr-root {
-    --bg:#0e1018; --surface:#161925; --surface2:#1c2030; --surface3:#232840;
-    --border:rgba(255,255,255,.07); --border-bright:rgba(255,255,255,.12);
-    --border-accent:rgba(79,158,255,.3); --text:#e8eaf2; --text-muted:#7e8aaa;
-    --text-dim:#464e6a; --accent:#4f9eff; --accent-dim:rgba(79,158,255,.15);
-    --accent-glow:rgba(79,158,255,.3); --red:#ff4d4d; --red-dim:rgba(255,77,77,.12);
-    --amber:#f59e0b; --green:#34d399; --green-dim:rgba(52,211,153,.12);
-    --radius:18px; --radius-sm:12px;
-    --font-display:'Syne',system-ui,sans-serif; --font-body:'DM Sans',system-ui,sans-serif;
-    background:var(--bg); color:var(--text); min-height:100vh;
-    font-family:var(--font-body); position:relative; overflow-x:hidden;
-    display:flex; flex-direction:column;
-  }
-  .cr-bg-dim {
-    position:fixed; inset:0;
-    background:
-      radial-gradient(ellipse 80% 60% at 20% 10%,rgba(30,40,80,.4) 0%,transparent 70%),
-      radial-gradient(ellipse 60% 50% at 80% 90%,rgba(10,20,50,.5) 0%,transparent 70%);
-    pointer-events:none; z-index:0;
-  }
+.cr-root {
+  --bg:#0e1018; --surface:#161925; --surface2:#1c2030; --surface3:#232840;
+  --border:rgba(255,255,255,.07); --border-b:rgba(255,255,255,.12);
+  --border-acc:rgba(79,158,255,.3); --text:#e8eaf2; --muted:#7e8aaa;
+  --dim:#464e6a; --acc:#4f9eff; --acc-dim:rgba(79,158,255,.15);
+  --acc-glow:rgba(79,158,255,.3); --red:#ff4d4d; --red-dim:rgba(255,77,77,.12);
+  --amber:#f59e0b; --green:#34d399; --green-dim:rgba(52,211,153,.12);
+  --r:18px; --rs:12px; --fd:'Syne',system-ui,sans-serif; --fb:'DM Sans',system-ui,sans-serif;
+  background:var(--bg); color:var(--text); min-height:100vh;
+  font-family:var(--fb); position:relative; overflow-x:hidden;
+  display:flex; flex-direction:column;
+}
+.cr-bg-dim {
+  position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    radial-gradient(ellipse 80% 60% at 20% 10%,rgba(30,40,80,.4),transparent 70%),
+    radial-gradient(ellipse 60% 50% at 80% 90%,rgba(10,20,50,.5),transparent 70%);
+}
 
-  @keyframes cr-slow-zoom  { 0%{transform:scale(1)} 100%{transform:scale(1.12)} }
-  @keyframes cr-fade-up    { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:translateY(0)} }
-  @keyframes timerPulse    { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
-  @keyframes modalIn       { from{opacity:0;transform:scale(.94) translateY(10px)} to{opacity:1;transform:none} }
-  @keyframes cr-glow-pulse { 0%,100%{box-shadow:0 0 24px rgba(79,158,255,.2)} 50%{box-shadow:0 0 40px rgba(79,158,255,.45)} }
-  @keyframes cr-spin       { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-  @keyframes cr-blink      { 0%,100%{opacity:1} 50%{opacity:.3} }
-  @keyframes cr-dot-bounce { 0%,80%,100%{transform:scale(0);opacity:0} 40%{transform:scale(1);opacity:1} }
-  @keyframes cr-overlay-in { from{opacity:0} to{opacity:1} }
+/* Keyframes */
+@keyframes cr-slow-zoom { 0%{transform:scale(1)} 100%{transform:scale(1.12)} }
+@keyframes cr-fade-up   { from{opacity:0;transform:translateY(24px)} to{opacity:1;transform:none} }
+@keyframes cr-pulse     { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+@keyframes cr-glow      { 0%,100%{box-shadow:0 0 24px rgba(79,158,255,.2)} 50%{box-shadow:0 0 40px rgba(79,158,255,.45)} }
+@keyframes cr-spin      { to{transform:rotate(360deg)} }
+@keyframes cr-blink     { 0%,100%{opacity:1} 50%{opacity:.3} }
+@keyframes cr-bounce    { 0%,80%,100%{transform:scale(0);opacity:0} 40%{transform:scale(1);opacity:1} }
+@keyframes cr-modal-in  { from{opacity:0;transform:scale(.94) translateY(10px)} to{opacity:1;transform:none} }
+@keyframes cr-ol-in     { from{opacity:0} to{opacity:1} }
 
-  /* ── FIX 4: AI Analysing Overlay ── */
-  .cr-ai-overlay {
-    position:fixed; inset:0; z-index:1200;
-    background:rgba(6,8,18,.84);
-    backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
-    display:flex; align-items:center; justify-content:center; padding:24px;
-    animation:cr-overlay-in .28s ease;
-  }
-  .cr-ai-overlay-card {
-    background:linear-gradient(145deg,#1c2138 0%,#141828 100%);
-    border:1px solid rgba(79,158,255,.3); border-radius:var(--radius);
-    padding:48px 44px; text-align:center; max-width:400px; width:100%;
-    box-shadow:0 0 0 1px rgba(255,255,255,.05) inset,0 0 80px rgba(79,158,255,.1),0 40px 80px rgba(0,0,0,.7);
-    display:flex; flex-direction:column; align-items:center; gap:16px;
-    position:relative; overflow:hidden;
-  }
-  .cr-ai-overlay-card::before {
-    content:''; position:absolute; top:0; left:0; right:0; height:1px;
-    background:linear-gradient(90deg,transparent,rgba(79,158,255,.5),transparent);
-  }
-  .cr-ai-overlay-ring-wrap {
-    position:relative; width:80px; height:80px;
-    display:flex; align-items:center; justify-content:center;
-  }
-  .cr-ai-overlay-ring-wrap svg { position:absolute; inset:0; }
-  .cr-ai-overlay-emoji { font-size:28px; position:relative; z-index:1; }
-  .cr-ai-overlay-title { font-family:var(--font-display); font-size:20px; font-weight:700; color:#fff; margin:0; }
-  .cr-ai-overlay-sub   { font-family:var(--font-body); font-size:14px; color:var(--text-muted); line-height:1.7; margin:0; }
-  .cr-ai-overlay-dots  { display:flex; gap:6px; align-items:center; }
-  .cr-ai-dot { width:8px; height:8px; border-radius:50%; background:var(--accent); animation:cr-dot-bounce 1.2s ease-in-out infinite; }
-  .cr-ai-overlay-lock-note {
-    display:flex; align-items:center; justify-content:center;
-    font-family:var(--font-body); font-size:11px; color:var(--text-dim);
-    margin-top:4px; line-height:1.5;
-  }
+/* AI Overlay */
+.cr-ai-overlay {
+  position:fixed; inset:0; z-index:1200;
+  background:rgba(6,8,18,.86); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+  display:flex; align-items:center; justify-content:center; padding:24px;
+  animation:cr-ol-in .28s ease;
+}
+.cr-ai-card {
+  background:linear-gradient(145deg,#1c2138,#141828);
+  border:1px solid rgba(79,158,255,.3); border-radius:var(--r);
+  padding:48px 44px; text-align:center; max-width:400px; width:100%;
+  box-shadow:0 0 80px rgba(79,158,255,.1),0 40px 80px rgba(0,0,0,.7);
+  display:flex; flex-direction:column; align-items:center; gap:16px;
+  position:relative; overflow:hidden;
+}
+.cr-ai-card::before {
+  content:''; position:absolute; top:0; left:0; right:0; height:1px;
+  background:linear-gradient(90deg,transparent,rgba(79,158,255,.5),transparent);
+}
+.cr-ai-ring  { position:relative; width:80px; height:80px; display:flex; align-items:center; justify-content:center; }
+.cr-ai-ring svg { position:absolute; inset:0; }
+.cr-ai-emoji { font-size:28px; position:relative; z-index:1; }
+.cr-ai-title { font-family:var(--fd); font-size:20px; font-weight:700; color:#fff; margin:0; }
+.cr-ai-sub   { font-family:var(--fb); font-size:14px; color:var(--muted); line-height:1.7; margin:0; }
+.cr-ai-dots  { display:flex; gap:6px; }
+.cr-ai-dot   { width:8px; height:8px; border-radius:50%; background:var(--acc); animation:cr-bounce 1.2s ease-in-out infinite; }
+.cr-ai-lock  { display:flex; align-items:center; justify-content:center; font-family:var(--fb); font-size:11px; color:var(--dim); line-height:1.5; }
 
-  /* ── FIX 2: Turn badges ── */
-  .cr-turn-badge {
-    display:flex; align-items:center; gap:7px;
-    font-family:var(--font-display); font-size:11px; font-weight:700;
-    letter-spacing:.5px; padding:6px 14px; border-radius:100px;
-    border:1px solid;
-  }
-  .cr-turn-badge-mine    { background:rgba(52,211,153,.1); border-color:rgba(52,211,153,.3); color:var(--green); }
-  .cr-turn-badge-partner { background:var(--surface2); border-color:var(--border); color:var(--text-muted); }
-  .cr-turn-dot           { width:7px; height:7px; border-radius:50%; }
-  .cr-turn-dot-mine      { background:var(--green); box-shadow:0 0 6px var(--green); animation:cr-blink 1.2s ease-in-out infinite; }
-  .cr-turn-dot-partner   { background:var(--text-dim); }
+/* Header */
+.cr-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:18px 28px; border-bottom:1px solid var(--border);
+  position:relative; z-index:10;
+  background:rgba(14,16,24,.88); backdrop-filter:blur(16px); flex-shrink:0;
+}
+.cr-logo        { display:flex; align-items:baseline; gap:6px; }
+.cr-logo-b2     { font-family:var(--fd); font-weight:800; font-size:22px; color:var(--acc); }
+.cr-logo-beruf  { font-family:var(--fd); font-weight:600; font-size:12px; color:var(--muted); letter-spacing:2.5px; text-transform:uppercase; }
+.cr-header-meta { display:flex; align-items:center; gap:10px; }
+.cr-round-badge { background:var(--surface2); border:1px solid var(--border-b); color:var(--muted); font-family:var(--fd); font-size:11px; font-weight:600; padding:5px 14px; border-radius:100px; }
+.cr-partner-badge { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); }
+.cr-partner-dot   { width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 7px var(--green); }
+.cr-rec-badge   { display:flex; align-items:center; gap:5px; background:rgba(255,77,77,.1); border:1px solid rgba(255,77,77,.3); color:var(--red); font-family:var(--fd); font-size:10px; font-weight:700; letter-spacing:1.5px; padding:4px 10px; border-radius:100px; }
+.cr-rec-dot     { width:6px; height:6px; border-radius:50%; background:var(--red); animation:cr-blink 1s ease-in-out infinite; }
+.cr-exit-btn    { background:var(--surface2); border:1px solid var(--border-b); color:var(--muted); cursor:pointer; width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; transition:all .2s; flex-shrink:0; }
+.cr-exit-btn:hover:not(:disabled) { background:var(--surface3); color:var(--text); border-color:rgba(255,255,255,.22); }
+.cr-exit-locked { opacity:.35; cursor:not-allowed!important; pointer-events:none; }
 
-  /* ── FIX 2: Mic locked state ── */
-  .cr-mic-locked {
-    opacity:.45; cursor:not-allowed !important;
-    background:var(--surface2) !important;
-    border-color:var(--border) !important;
-    color:var(--text-dim) !important;
-  }
+/* Intro / Hero */
+.cr-intro       { position:relative; min-height:100vh; display:flex; flex-direction:column; overflow:hidden; }
+.cr-hero-bg     { position:absolute; inset:-8%; background-size:cover; background-position:center; animation:cr-slow-zoom 18s ease-in-out infinite alternate; z-index:0; }
+.cr-hero-top    { position:absolute; top:0; left:0; right:0; height:220px; background:linear-gradient(to bottom,rgba(10,12,22,.92),transparent); z-index:1; pointer-events:none; }
+.cr-hero-bot    { position:absolute; bottom:0; left:0; right:0; height:75%; background:linear-gradient(to top,rgba(8,10,20,.98) 0%,rgba(8,10,20,.9) 30%,rgba(8,10,20,.6) 60%,transparent); z-index:1; pointer-events:none; }
+.cr-hero-content{ position:relative; z-index:5; flex:1; display:flex; flex-direction:column; align-items:flex-start; justify-content:flex-end; padding:0 56px 64px; max-width:800px; animation:cr-fade-up .8s ease both .15s; }
+.cr-hero-eyebrow{ font-family:var(--fd); font-size:11px; font-weight:600; letter-spacing:3px; text-transform:uppercase; color:var(--acc); margin-bottom:18px; }
+.cr-hero-title  { font-family:var(--fd); font-size:clamp(44px,7vw,80px); font-weight:800; line-height:1.05; letter-spacing:-2px; color:#fff; margin:0 0 20px; }
+.cr-hero-accent { background:linear-gradient(120deg,#4f9eff,#a78bfa); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+.cr-hero-sub    { font-family:var(--fb); font-size:16px; color:rgba(255,255,255,.55); margin-bottom:32px; line-height:1.6; }
+.cr-hero-meta-row  { display:flex; align-items:center; margin-bottom:40px; flex-wrap:wrap; gap:8px; }
+.cr-hero-meta-item { display:flex; align-items:center; gap:7px; font-size:13px; color:rgba(255,255,255,.5); }
+.cr-hero-meta-div  { width:1px; height:14px; background:rgba(255,255,255,.18); margin:0 12px; }
+.cr-hero-btn {
+  display:inline-flex; align-items:center; gap:12px;
+  background:linear-gradient(135deg,#3b82f6,#6366f1);
+  color:#fff; border:none; padding:16px 36px; border-radius:100px;
+  font-family:var(--fd); font-size:16px; font-weight:700; cursor:pointer;
+  box-shadow:0 0 0 1px rgba(255,255,255,.1) inset,0 12px 32px rgba(79,100,255,.45);
+  transition:transform .18s,box-shadow .18s; animation:cr-glow 3s ease-in-out infinite;
+}
+.cr-hero-btn:hover { transform:translateY(-3px); box-shadow:0 0 0 1px rgba(255,255,255,.15) inset,0 18px 44px rgba(79,100,255,.55); }
+@media(max-width:640px){ .cr-hero-content{padding:0 24px 48px} .cr-hero-title{font-size:40px;letter-spacing:-1px} }
 
-  /* ── Hero ── */
-  .cr-intro-stage { position:relative; min-height:100vh; display:flex; flex-direction:column; overflow:hidden; }
-  .cr-hero-bg {
-    position:absolute; inset:-8%; background-size:cover; background-position:center;
-    animation:cr-slow-zoom 18s ease-in-out infinite alternate;
-    will-change:transform; z-index:0;
-  }
-  .cr-hero-overlay-top {
-    position:absolute; top:0; left:0; right:0; height:220px;
-    background:linear-gradient(to bottom,rgba(10,12,22,.92) 0%,transparent 100%);
-    z-index:1; pointer-events:none;
-  }
-  .cr-hero-overlay-bottom {
-    position:absolute; bottom:0; left:0; right:0; height:75%;
-    background:linear-gradient(to top,rgba(8,10,20,.98) 0%,rgba(8,10,20,.9) 30%,rgba(8,10,20,.6) 60%,transparent 100%);
-    z-index:1; pointer-events:none;
-  }
-  .cr-header-hero { position:relative; z-index:10; background:transparent!important; border-bottom:1px solid rgba(255,255,255,.06)!important; }
-  .cr-hero-content {
-    position:relative; z-index:5; flex:1;
-    display:flex; flex-direction:column; align-items:flex-start; justify-content:flex-end;
-    padding:0 56px 64px; max-width:800px;
-    animation:cr-fade-up .8s ease both; animation-delay:.15s;
-  }
-  .cr-hero-eyebrow { font-family:var(--font-display); font-size:11px; font-weight:600; letter-spacing:3px; text-transform:uppercase; color:var(--accent); margin-bottom:18px; }
-  .cr-hero-title   { font-family:var(--font-display); font-size:clamp(44px,7vw,80px); font-weight:800; line-height:1.05; letter-spacing:-2px; color:#fff; margin:0 0 20px; }
-  .cr-hero-title-accent {
-    background:linear-gradient(120deg,#4f9eff 0%,#a78bfa 100%);
-    -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
-  }
-  .cr-hero-sub { font-family:var(--font-body); font-size:16px; color:rgba(255,255,255,.55); margin-bottom:32px; line-height:1.6; }
-  .cr-hero-meta-row { display:flex; align-items:center; margin-bottom:40px; flex-wrap:wrap; gap:8px; }
-  .cr-hero-meta-item { display:flex; align-items:center; gap:7px; font-size:13px; color:rgba(255,255,255,.5); }
-  .cr-hero-meta-icon { font-size:14px; }
-  .cr-hero-meta-divider { width:1px; height:14px; background:rgba(255,255,255,.18); margin:0 12px; }
-  .cr-hero-start-btn {
-    display:inline-flex; align-items:center; gap:12px;
-    background:linear-gradient(135deg,#3b82f6 0%,#6366f1 100%);
-    color:#fff; border:none; padding:16px 36px; border-radius:100px;
-    font-family:var(--font-display); font-size:16px; font-weight:700; cursor:pointer;
-    box-shadow:0 0 0 1px rgba(255,255,255,.1) inset,0 12px 32px rgba(79,100,255,.45);
-    transition:transform .18s,box-shadow .18s;
-    animation:cr-glow-pulse 3s ease-in-out infinite;
-  }
-  .cr-hero-start-btn:hover { transform:translateY(-3px); box-shadow:0 0 0 1px rgba(255,255,255,.15) inset,0 18px 44px rgba(79,100,255,.55); }
-  @media(max-width:640px){ .cr-hero-content{padding:0 24px 48px} .cr-hero-title{font-size:40px;letter-spacing:-1px} }
+/* Main / phase anim */
+.cr-main      { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; transition:opacity .22s,transform .22s; }
+.cr-main-in   { opacity:1; transform:none; }
+.cr-main-out  { opacity:0; transform:translateY(12px); }
+.cr-center    { display:flex; align-items:flex-start; justify-content:center; flex:1; padding:40px 24px; min-height:70vh; }
 
-  /* ── Header ── */
-  .cr-header {
-    display:flex; align-items:center; justify-content:space-between;
-    padding:18px 28px; border-bottom:1px solid var(--border);
-    position:relative; z-index:10;
-    background:rgba(14,16,24,.88); backdrop-filter:blur(16px); flex-shrink:0;
-  }
-  .cr-logo { display:flex; align-items:baseline; gap:6px; }
-  .cr-logo-b2    { font-family:var(--font-display); font-weight:800; font-size:22px; color:var(--accent); }
-  .cr-logo-beruf { font-family:var(--font-display); font-weight:600; font-size:12px; color:var(--text-muted); letter-spacing:2.5px; text-transform:uppercase; }
-  .cr-header-meta { display:flex; align-items:center; gap:10px; }
-  .cr-round-badge {
-    background:var(--surface2); border:1px solid var(--border-bright);
-    color:var(--text-muted); font-family:var(--font-display);
-    font-size:11px; font-weight:600; letter-spacing:.5px; padding:5px 14px; border-radius:100px;
-  }
-  .cr-partner-badge { display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-muted); }
-  .cr-partner-dot   { width:7px; height:7px; border-radius:50%; background:var(--green); box-shadow:0 0 7px var(--green); }
-  .cr-recording-badge {
-    display:flex; align-items:center; gap:5px;
-    background:rgba(255,77,77,.1); border:1px solid rgba(255,77,77,.3);
-    color:var(--red); font-family:var(--font-display);
-    font-size:10px; font-weight:700; letter-spacing:1.5px; padding:4px 10px; border-radius:100px;
-  }
-  .cr-recording-dot { width:6px; height:6px; border-radius:50%; background:var(--red); animation:cr-blink 1s ease-in-out infinite; }
-  .cr-exit-btn {
-    background:var(--surface2); border:1px solid var(--border-bright);
-    color:var(--text-muted); cursor:pointer;
-    width:36px; height:36px; border-radius:50%;
-    display:flex; align-items:center; justify-content:center;
-    transition:all .2s; flex-shrink:0;
-  }
-  .cr-exit-btn:hover:not(:disabled) { background:var(--surface3); color:var(--text); border-color:rgba(255,255,255,.22); }
-  .cr-exit-btn-locked { opacity:.35; cursor:not-allowed!important; }
-  .cr-exit-btn:disabled { pointer-events:none; }
+/* Game layout */
+.cr-game { display:grid; grid-template-columns:180px 1fr; gap:36px; padding:40px 48px; align-items:start; max-width:1020px; margin:0 auto; width:100%; box-sizing:border-box; }
+@media(max-width:740px){ .cr-game{grid-template-columns:1fr;padding:24px 20px;gap:24px} }
 
-  /* ── Phase transitions ── */
-  .cr-main { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; transition:opacity .24s ease,transform .24s ease; }
-  .cr-phase-in  { opacity:1; transform:translateY(0); }
-  .cr-phase-out { opacity:0; transform:translateY(12px); }
+/* Timer col */
+.cr-timer-col   { display:flex; flex-direction:column; align-items:center; gap:14px; position:sticky; top:28px; }
+.cr-timer-wrap  { position:relative; filter:drop-shadow(0 0 20px rgba(79,158,255,.15)); }
+.cr-timer-urgent{ animation:cr-pulse .7s ease-in-out infinite; }
+.cr-phase-pill  { font-family:var(--fd); font-size:10px; font-weight:700; letter-spacing:2px; text-transform:uppercase; padding:5px 16px; border-radius:100px; }
+.cr-phase-pill-prep  { background:rgba(245,158,11,.1); color:var(--amber); border:1px solid rgba(245,158,11,.25); }
+.cr-phase-pill-speak { background:var(--acc-dim); color:var(--acc); border:1px solid var(--border-acc); }
+.cr-skip  { background:none; border:1px solid var(--border-b); color:var(--muted); font-family:var(--fb); font-size:12px; padding:7px 16px; border-radius:100px; cursor:pointer; transition:all .2s; }
+.cr-skip:hover { background:var(--surface2); color:var(--text); }
+.cr-role-badge { background:var(--surface2); border:1px solid var(--border); color:var(--muted); font-size:11px; padding:5px 12px; border-radius:100px; }
 
-  /* ── Center stage ── */
-  .cr-center-stage { display:flex; align-items:flex-start; justify-content:center; flex:1; padding:40px 24px; min-height:70vh; }
+/* Turn badge */
+.cr-turn      { display:flex; align-items:center; gap:7px; font-family:var(--fd); font-size:11px; font-weight:700; padding:6px 14px; border-radius:100px; border:1px solid; }
+.cr-turn-mine { background:rgba(52,211,153,.1); border-color:rgba(52,211,153,.3); color:var(--green); }
+.cr-turn-other{ background:var(--surface2); border-color:var(--border); color:var(--muted); }
+.cr-turn-dot      { width:7px; height:7px; border-radius:50%; background:var(--dim); }
+.cr-turn-dot-mine { background:var(--green); box-shadow:0 0 6px var(--green); animation:cr-blink 1.2s ease-in-out infinite; }
 
-  /* ── Game layout ── */
-  .cr-game-layout {
-    display:grid; grid-template-columns:180px 1fr;
-    gap:36px; padding:40px 48px; align-items:start;
-    max-width:1020px; margin:0 auto; width:100%; box-sizing:border-box;
-  }
-  @media(max-width:740px){ .cr-game-layout{grid-template-columns:1fr;padding:24px 20px;gap:24px} }
+/* Mic */
+.cr-mic { display:flex; align-items:center; gap:6px; background:var(--surface2); border:1px solid var(--border-b); color:var(--muted); font-family:var(--fb); font-size:11px; padding:7px 14px; border-radius:100px; cursor:pointer; transition:all .2s; }
+.cr-mic:hover:not(.cr-mic-locked) { background:var(--surface3); color:var(--text); }
+.cr-mic-on     { background:rgba(255,77,77,.12); border-color:rgba(255,77,77,.3); color:var(--red); }
+.cr-mic-on:hover { background:rgba(255,77,77,.2); }
+.cr-mic-locked { opacity:.42; cursor:not-allowed; pointer-events:none; }
 
-  /* ── Timer col ── */
-  .cr-timer-col { display:flex; flex-direction:column; align-items:center; gap:14px; position:sticky; top:28px; }
-  .cr-timer-wrap { position:relative; filter:drop-shadow(0 0 20px rgba(79,158,255,.15)); }
-  .cr-timer-urgent { animation:timerPulse .7s ease-in-out infinite; }
-  .cr-phase-pill { font-family:var(--font-display); font-size:10px; font-weight:700; letter-spacing:2px; text-transform:uppercase; padding:5px 16px; border-radius:100px; }
-  .cr-phase-pill-prep  { background:rgba(245,158,11,.1); color:var(--amber); border:1px solid rgba(245,158,11,.25); }
-  .cr-phase-pill-speak { background:var(--accent-dim); color:var(--accent); border:1px solid var(--border-accent); }
-  .cr-skip-btn {
-    background:none; border:1px solid var(--border-bright);
-    color:var(--text-muted); font-family:var(--font-body); font-size:12px;
-    padding:7px 16px; border-radius:100px; cursor:pointer; transition:all .2s;
-  }
-  .cr-skip-btn:hover { background:var(--surface2); color:var(--text); border-color:rgba(255,255,255,.2); }
-  .cr-role-badge { background:var(--surface2); border:1px solid var(--border); color:var(--text-muted); font-size:11px; padding:5px 12px; border-radius:100px; }
-  .cr-mic-toggle {
-    display:flex; align-items:center; gap:6px;
-    background:var(--surface2); border:1px solid var(--border-bright);
-    color:var(--text-muted); font-family:var(--font-body); font-size:11px;
-    padding:7px 14px; border-radius:100px; cursor:pointer; transition:all .2s;
-  }
-  .cr-mic-toggle:hover:not(:disabled):not(.cr-mic-locked) { background:var(--surface3); color:var(--text); }
-  .cr-mic-active { background:rgba(255,77,77,.12); border-color:rgba(255,77,77,.3); color:var(--red); }
-  .cr-mic-active:hover:not(:disabled) { background:rgba(255,77,77,.2); }
+/* Listening badge */
+.cr-listening-badge { display:flex; align-items:center; gap:6px; font-family:var(--fd); font-size:11px; font-weight:600; color:var(--muted); padding:6px 14px; border-radius:100px; background:var(--surface2); border:1px solid var(--border); }
+.cr-listening-dot   { width:7px; height:7px; border-radius:50%; background:var(--acc); animation:cr-blink 1.2s ease-in-out infinite; }
 
-  /* ── Card col ── */
-  .cr-card-col { display:flex; flex-direction:column; gap:16px; }
-  .cr-topic-chip {
-    display:inline-flex; align-items:center;
-    background:var(--accent-dim); border:1px solid var(--border-accent);
-    color:var(--accent); font-family:var(--font-display);
-    font-size:10px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase;
-    padding:5px 14px; border-radius:100px; align-self:flex-start;
-  }
-  .cr-question-card {
-    background:linear-gradient(145deg,#1a1f32 0%,#141828 100%);
-    border:1px solid var(--border-bright); border-radius:var(--radius);
-    padding:28px 32px;
-    box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,6px 6px 20px rgba(0,0,0,.5);
-    position:relative; overflow:hidden;
-  }
-  .cr-question-card::before { content:''; position:absolute; top:0; left:0; right:0; height:1px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.1),transparent); }
-  .cr-question-number { font-family:var(--font-display); font-size:10px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:var(--text-dim); margin-bottom:14px; }
-  .cr-question-text { font-family:var(--font-body); font-size:18px; line-height:1.75; color:var(--text); margin:0; }
+/* Card col */
+.cr-card-col { display:flex; flex-direction:column; gap:16px; }
+.cr-topic-chip { display:inline-flex; align-items:center; background:var(--acc-dim); border:1px solid var(--border-acc); color:var(--acc); font-family:var(--fd); font-size:10px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; padding:5px 14px; border-radius:100px; align-self:flex-start; }
+.cr-q-card { background:linear-gradient(145deg,#1a1f32,#141828); border:1px solid var(--border-b); border-radius:var(--r); padding:28px 32px; box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,6px 6px 20px rgba(0,0,0,.5); position:relative; overflow:hidden; }
+.cr-q-card::before { content:''; position:absolute; top:0; left:0; right:0; height:1px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.1),transparent); }
+.cr-q-num  { font-family:var(--fd); font-size:10px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:var(--dim); margin-bottom:14px; }
+.cr-q-text { font-family:var(--fb); font-size:18px; line-height:1.75; color:var(--text); margin:0; }
 
-  /* ── FIX 3: Live Transcript Box ── */
-  .cr-transcript-box {
-    background:rgba(255,255,255,.03);
-    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
-    border:1px solid rgba(79,158,255,.2); border-radius:var(--radius-sm); overflow:hidden;
-  }
-  .cr-transcript-header { display:flex; align-items:center; gap:8px; padding:10px 16px; border-bottom:1px solid rgba(255,255,255,.06); }
-  .cr-transcript-icon  { font-size:13px; }
-  .cr-transcript-label { font-family:var(--font-display); font-size:10px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--text-muted); flex:1; }
-  .cr-transcript-dot-live { width:6px; height:6px; border-radius:50%; background:var(--accent); animation:cr-blink 1.2s ease-in-out infinite; }
-  .cr-transcript-body { padding:14px 16px; min-height:80px; max-height:180px; overflow-y:auto; font-family:var(--font-body); font-size:14px; line-height:1.7; }
-  .cr-transcript-placeholder { color:var(--text-dim); font-style:italic; }
-  .cr-transcript-final   { color:var(--text); }                           /* white — confirmed */
-  .cr-transcript-interim { color:rgba(255,255,255,.38); font-style:italic; } /* grey italic — in progress */
-  .cr-transcript-partner { padding:10px 16px; border-top:1px solid rgba(255,255,255,.06); }
-  .cr-transcript-partner-label { font-size:11px; color:var(--text-dim); font-family:var(--font-display); font-weight:600; letter-spacing:1px; text-transform:uppercase; margin-right:8px; }
-  .cr-transcript-partner-text  { font-size:13px; color:rgba(255,255,255,.45); }
+/* Transcript box */
+.cr-transcript-box    { background:rgba(255,255,255,.03); backdrop-filter:blur(20px); border:1px solid rgba(79,158,255,.2); border-radius:var(--rs); overflow:hidden; }
+.cr-transcript-header { display:flex; align-items:center; gap:8px; padding:10px 16px; border-bottom:1px solid rgba(255,255,255,.06); }
+.cr-ti-icon      { font-size:13px; }
+.cr-ti-label     { font-family:var(--fd); font-size:10px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted); flex:1; }
+.cr-ti-live-dot  { width:6px; height:6px; border-radius:50%; background:var(--acc); animation:cr-blink 1.2s ease-in-out infinite; }
+.cr-ti-body      { padding:14px 16px; min-height:80px; max-height:180px; overflow-y:auto; font-family:var(--fb); font-size:14px; line-height:1.7; }
+.cr-ti-ph        { color:var(--dim); font-style:italic; }
+.cr-ti-final     { color:var(--text); }
+.cr-ti-interim   { color:rgba(255,255,255,.38); font-style:italic; }
+.cr-ti-partner   { padding:10px 16px; border-top:1px solid rgba(255,255,255,.06); }
+.cr-ti-plabel    { font-size:11px; color:var(--dim); font-family:var(--fd); font-weight:600; letter-spacing:1px; text-transform:uppercase; margin-right:8px; }
+.cr-ti-ptext     { font-size:13px; color:rgba(255,255,255,.45); }
 
-  /* ── Redemittel ── */
-  .cr-redemittel {
-    background:rgba(255,255,255,.03);
-    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,.09); border-radius:var(--radius-sm);
-    overflow:hidden; transition:border-color .25s,background .25s; position:relative;
-  }
-  .cr-redemittel::before { content:''; position:absolute; top:0; left:0; right:0; height:1px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent); pointer-events:none; }
-  .cr-redemittel-open { background:rgba(79,158,255,.04); border-color:rgba(79,158,255,.22); }
-  .cr-redemittel-toggle {
-    width:100%; background:none; border:none; color:var(--text-muted);
-    font-family:var(--font-display); font-size:12px; font-weight:700;
-    letter-spacing:1px; text-transform:uppercase; padding:14px 18px;
-    display:flex; align-items:center; gap:9px; cursor:pointer; text-align:left; transition:color .2s;
-  }
-  .cr-redemittel-toggle:hover { color:var(--text); }
-  .cr-redemittel-chevron { font-size:11px; color:var(--accent); width:13px; flex-shrink:0; }
-  .cr-redemittel-label  { flex:1; }
-  .cr-redemittel-count  { background:var(--surface3); border:1px solid var(--border); color:var(--text-dim); font-size:10px; padding:2px 9px; border-radius:100px; }
-  .cr-redemittel-body   { border-top:1px solid rgba(255,255,255,.06); padding:4px 0 12px; }
-  .cr-redemittel-list   { list-style:none; margin:0; padding:0 18px; display:flex; flex-direction:column; gap:6px; max-height:260px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--surface3) transparent; }
-  .cr-redemittel-item   { display:flex; align-items:flex-start; gap:10px; font-family:var(--font-body); font-size:13px; line-height:1.65; color:rgba(255,255,255,.55); padding:6px 0; border-bottom:1px solid rgba(255,255,255,.04); transition:color .15s; }
-  .cr-redemittel-item:last-child { border-bottom:none; }
-  .cr-redemittel-item:hover { color:rgba(255,255,255,.8); }
-  .cr-redemittel-bullet { width:4px; height:4px; border-radius:50%; background:var(--accent); margin-top:8px; flex-shrink:0; box-shadow:0 0 4px var(--accent); }
+/* Redemittel */
+.cr-rdm        { background:rgba(255,255,255,.03); backdrop-filter:blur(20px); border:1px solid rgba(255,255,255,.09); border-radius:var(--rs); overflow:hidden; transition:all .25s; position:relative; }
+.cr-rdm::before{ content:''; position:absolute; top:0; left:0; right:0; height:1px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent); pointer-events:none; }
+.cr-rdm-open   { background:rgba(79,158,255,.04); border-color:rgba(79,158,255,.22); }
+.cr-rdm-toggle { width:100%; background:none; border:none; color:var(--muted); font-family:var(--fd); font-size:12px; font-weight:700; letter-spacing:1px; text-transform:uppercase; padding:14px 18px; display:flex; align-items:center; gap:9px; cursor:pointer; transition:color .2s; }
+.cr-rdm-toggle:hover { color:var(--text); }
+.cr-rdm-chev   { font-size:11px; color:var(--acc); width:13px; }
+.cr-rdm-lbl    { flex:1; text-align:left; }
+.cr-rdm-cnt    { background:var(--surface3); border:1px solid var(--border); color:var(--dim); font-size:10px; padding:2px 9px; border-radius:100px; }
+.cr-rdm-list   { list-style:none; margin:0; padding:8px 18px 12px; display:flex; flex-direction:column; gap:6px; max-height:260px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--surface3) transparent; border-top:1px solid rgba(255,255,255,.06); }
+.cr-rdm-item   { display:flex; align-items:flex-start; gap:10px; font-family:var(--fb); font-size:13px; line-height:1.65; color:rgba(255,255,255,.55); padding:6px 0; border-bottom:1px solid rgba(255,255,255,.04); transition:color .15s; }
+.cr-rdm-item:last-child { border-bottom:none; }
+.cr-rdm-item:hover { color:rgba(255,255,255,.8); }
+.cr-rdm-dot    { width:4px; height:4px; border-radius:50%; background:var(--acc); margin-top:8px; flex-shrink:0; box-shadow:0 0 4px var(--acc); }
 
-  /* ── AI Feedback Card ── */
-  .cr-feedback-card {
-    background:rgba(255,255,255,.03);
-    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
-    border:1px solid rgba(79,158,255,.25); border-radius:var(--radius);
-    padding:28px 32px;
-    box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 12px 40px rgba(0,0,0,.4);
-    position:relative; overflow:hidden;
-  }
-  .cr-feedback-card::before { content:''; position:absolute; top:0; left:0; right:0; height:1px; background:linear-gradient(90deg,transparent,rgba(79,158,255,.4),transparent); }
-  .cr-feedback-loading { display:flex; flex-direction:column; align-items:center; gap:14px; padding:36px; }
-  .cr-feedback-spinner { display:flex; }
-  .cr-feedback-loading-text { font-family:var(--font-display); font-size:13px; color:var(--text-muted); letter-spacing:.5px; }
-  .cr-feedback-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
-  .cr-feedback-title-row { display:flex; align-items:center; gap:10px; }
-  .cr-feedback-icon  { font-size:20px; }
-  .cr-feedback-title { font-family:var(--font-display); font-size:16px; font-weight:700; color:var(--text); margin:0; }
-  .cr-feedback-stars { display:flex; align-items:center; gap:3px; }
-  .cr-star        { font-size:18px; color:var(--surface3); transition:color .2s; }
-  .cr-star-filled { color:#f59e0b; filter:drop-shadow(0 0 4px rgba(245,158,11,.5)); }
-  .cr-feedback-score-label { font-family:var(--font-display); font-size:12px; font-weight:700; color:var(--text-muted); margin-left:6px; }
-  .cr-feedback-section      { margin-bottom:18px; }
-  .cr-feedback-section-last { margin-bottom:0; }
-  .cr-feedback-section-label { font-family:var(--font-display); font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:var(--text-dim); margin-bottom:8px; }
-  .cr-feedback-original  { font-family:var(--font-body); font-size:14px; line-height:1.75; color:rgba(255,255,255,.65); margin:0; }
-  .cr-feedback-corrected { font-family:var(--font-body); font-size:14px; line-height:1.75; margin:0; }
-  .cr-feedback-errors    { display:flex; flex-direction:column; gap:8px; }
-  .cr-feedback-error-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:13px; }
-  .cr-feedback-error-orig { background:var(--red-dim); border:1px solid rgba(255,77,77,.2); padding:2px 8px; border-radius:6px; }
-  .cr-feedback-error-fix  { background:var(--green-dim); border:1px solid rgba(52,211,153,.2); padding:2px 8px; border-radius:6px; }
-  .cr-feedback-arrow { color:var(--text-dim); font-size:14px; }
-  .cr-feedback-text { font-family:var(--font-body); font-size:14px; line-height:1.75; color:rgba(255,255,255,.6); margin:0; }
+/* AI Feedback Card */
+.cr-fc { background:rgba(255,255,255,.03); backdrop-filter:blur(20px); border:1px solid rgba(79,158,255,.25); border-radius:var(--r); padding:28px 32px; box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 12px 40px rgba(0,0,0,.4); position:relative; overflow:hidden; }
+.cr-fc::before { content:''; position:absolute; top:0; left:0; right:0; height:1px; background:linear-gradient(90deg,transparent,rgba(79,158,255,.4),transparent); }
+.cr-fc-loading { display:flex; flex-direction:column; align-items:center; gap:14px; padding:36px; }
+.cr-fc-loading-text { font-family:var(--fd); font-size:13px; color:var(--muted); }
+.cr-fc-header  { display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
+.cr-fc-title-row { display:flex; align-items:center; gap:10px; }
+.cr-fc-icon    { font-size:20px; }
+.cr-fc-title   { font-family:var(--fd); font-size:16px; font-weight:700; color:var(--text); margin:0; }
+.cr-fc-stars   { display:flex; align-items:center; gap:3px; }
+.cr-star       { font-size:18px; color:var(--surface3); }
+.cr-star-on    { color:#f59e0b; filter:drop-shadow(0 0 4px rgba(245,158,11,.5)); }
+.cr-fc-score   { font-family:var(--fd); font-size:12px; font-weight:700; color:var(--muted); margin-left:6px; }
+.cr-fc-sec     { margin-bottom:18px; }
+.cr-fc-sec-last{ margin-bottom:0; }
+.cr-fc-label   { font-family:var(--fd); font-size:9px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:var(--dim); margin-bottom:8px; }
+.cr-fc-orig    { font-family:var(--fb); font-size:14px; line-height:1.75; color:rgba(255,255,255,.65); margin:0; }
+.cr-fc-corr    { font-family:var(--fb); font-size:14px; line-height:1.75; margin:0; }
+.cr-fc-errors  { display:flex; flex-direction:column; gap:8px; }
+.cr-fc-erow    { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:13px; }
+.cr-fc-eorig   { background:var(--red-dim); border:1px solid rgba(255,77,77,.2); padding:2px 8px; border-radius:6px; }
+.cr-fc-efix    { background:var(--green-dim); border:1px solid rgba(52,211,153,.2); padding:2px 8px; border-radius:6px; }
+.cr-fc-arrow   { color:var(--dim); font-size:14px; }
+.cr-fc-text    { font-family:var(--fb); font-size:14px; line-height:1.75; color:rgba(255,255,255,.6); margin:0; }
+.error-text     { color:var(--red); background:var(--red-dim); border-radius:3px; padding:1px 4px; font-style:italic; text-decoration:underline wavy rgba(255,77,77,.6); }
+.corrected-text { color:var(--green); background:var(--green-dim); border-radius:3px; padding:1px 4px; }
 
-  .error-text     { color:var(--red); background:var(--red-dim); border-radius:3px; padding:1px 4px; font-style:italic; text-decoration:underline wavy rgba(255,77,77,.6); }
-  .corrected-text { color:var(--green); background:var(--green-dim); border-radius:3px; padding:1px 4px; }
+/* Assess */
+.cr-assess-wide     { display:flex; flex-direction:column; gap:20px; width:100%; max-width:680px; }
+.cr-assess-hdr      { text-align:center; display:flex; flex-direction:column; align-items:center; gap:8px; }
+.cr-assess-icon-lbl { font-size:36px; }
+.cr-assess-h        { font-family:var(--fd); font-size:26px; font-weight:700; margin:0; color:var(--text); }
+.cr-assess-sub      { font-family:var(--fb); color:var(--muted); font-size:14px; margin:0; }
+.cr-assess-card     { background:linear-gradient(145deg,#1a1f32,#141828); border:1px solid var(--border-b); border-radius:var(--r); padding:24px 28px; box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 16px 40px rgba(0,0,0,.5); display:flex; flex-direction:column; gap:12px; }
+.cr-assess-note-lbl { font-family:var(--fd); font-size:11px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted); }
+.cr-assess-ta       { width:100%; background:var(--surface3); border:1px solid var(--border-b); border-radius:var(--rs); color:var(--text); font-family:var(--fb); font-size:15px; line-height:1.65; padding:14px 18px; resize:vertical; outline:none; transition:border-color .2s,box-shadow .2s; box-sizing:border-box; }
+.cr-assess-ta:focus { border-color:var(--border-acc); box-shadow:0 0 0 3px rgba(79,158,255,.1); }
+.cr-assess-ta::placeholder { color:var(--dim); }
+.cr-pfb-wrap  { display:flex; flex-direction:column; gap:10px; }
+.cr-pfb-label { font-family:var(--fd); font-size:11px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--muted); }
 
-  /* ── Assess ── */
-  .cr-assess-wide { display:flex; flex-direction:column; gap:20px; width:100%; max-width:680px; }
-  .cr-assess-header { text-align:center; display:flex; flex-direction:column; align-items:center; gap:8px; }
-  .cr-assess-icon    { font-size:36px; }
-  .cr-assess-heading { font-family:var(--font-display); font-size:26px; font-weight:700; margin:0; color:var(--text); }
-  .cr-assess-sub     { font-family:var(--font-body); color:var(--text-muted); font-size:14px; margin:0; line-height:1.6; }
-  .cr-assess-card {
-    background:linear-gradient(145deg,#1a1f32 0%,#141828 100%);
-    border:1px solid var(--border-bright); border-radius:var(--radius);
-    padding:24px 28px;
-    box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 16px 40px rgba(0,0,0,.5);
-    display:flex; flex-direction:column; gap:12px;
-  }
-  .cr-assess-notes-label { font-family:var(--font-display); font-size:11px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--text-muted); }
-  .cr-assess-textarea {
-    width:100%; background:var(--surface3); border:1px solid var(--border-bright);
-    border-radius:var(--radius-sm); color:var(--text); font-family:var(--font-body);
-    font-size:15px; line-height:1.65; padding:14px 18px; resize:vertical;
-    outline:none; transition:border-color .2s,box-shadow .2s; box-sizing:border-box;
-  }
-  .cr-assess-textarea:focus { border-color:var(--border-accent); box-shadow:0 0 0 3px rgba(79,158,255,.1); }
-  .cr-assess-textarea::placeholder { color:var(--text-dim); }
+/* Primary button */
+.cr-primary-btn { display:inline-flex; align-items:center; justify-content:center; background:linear-gradient(135deg,#3b82f6,#6366f1); color:#fff; border:none; padding:14px 34px; border-radius:100px; font-family:var(--fd); font-size:15px; font-weight:700; cursor:pointer; box-shadow:0 0 0 1px rgba(255,255,255,.12) inset,0 8px 28px rgba(79,100,255,.4); transition:transform .15s,box-shadow .15s; }
+.cr-primary-btn:hover:not(:disabled) { transform:translateY(-2px); box-shadow:0 0 0 1px rgba(255,255,255,.15) inset,0 14px 36px rgba(79,100,255,.55); }
+.cr-primary-btn:disabled { opacity:.4; cursor:not-allowed; }
 
-  .cr-partner-feedback-wrap  { display:flex; flex-direction:column; gap:10px; }
-  .cr-partner-feedback-label { font-family:var(--font-display); font-size:11px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; color:var(--text-muted); }
+/* Switch */
+.cr-switch-card  { background:linear-gradient(145deg,#1a1f32,#141828); border:1px solid var(--border-b); border-radius:var(--r); padding:52px 44px; text-align:center; max-width:380px; width:100%; box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 24px 56px rgba(0,0,0,.55); display:flex; flex-direction:column; align-items:center; gap:14px; }
+.cr-switch-icon  { width:62px; height:62px; border-radius:50%; background:var(--acc-dim); border:1px solid var(--border-acc); display:flex; align-items:center; justify-content:center; margin-bottom:6px; }
+.cr-switch-title { font-family:var(--fd); font-size:26px; font-weight:700; margin:0; color:var(--text); }
+.cr-switch-sub   { font-family:var(--fb); color:var(--muted); font-size:14px; margin:0; line-height:1.6; }
+.cr-switch-sub strong { color:var(--acc); font-weight:500; }
+.cr-switch-wait  { font-family:var(--fb); font-size:14px; color:var(--dim); margin:0; animation:cr-blink 2s ease-in-out infinite; }
 
-  .cr-primary-btn {
-    display:inline-flex; align-items:center; justify-content:center;
-    background:linear-gradient(135deg,#3b82f6 0%,#6366f1 100%);
-    color:#fff; border:none; padding:14px 34px; border-radius:100px;
-    font-family:var(--font-display); font-size:15px; font-weight:700; cursor:pointer;
-    box-shadow:0 0 0 1px rgba(255,255,255,.12) inset,0 8px 28px rgba(79,100,255,.4);
-    transition:transform .15s,box-shadow .15s;
-  }
-  .cr-primary-btn:hover:not(:disabled) { transform:translateY(-2px); box-shadow:0 0 0 1px rgba(255,255,255,.15) inset,0 14px 36px rgba(79,100,255,.55); }
-  .cr-primary-btn:disabled { opacity:.4; cursor:not-allowed; }
+/* Finish */
+.cr-finish-wide  { display:flex; flex-direction:column; gap:20px; width:100%; max-width:680px; }
+.cr-finish-card  { background:linear-gradient(145deg,#1a1f32,#141828); border:1px solid var(--border-b); border-radius:var(--r); padding:52px 48px; text-align:center; width:100%; box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 32px 72px rgba(0,0,0,.6); display:flex; flex-direction:column; align-items:center; gap:8px; }
+.cr-finish-trophy{ font-size:52px; margin-bottom:8px; }
+.cr-finish-title { font-family:var(--fd); font-size:40px; font-weight:800; margin:0; color:var(--text); letter-spacing:-1px; }
+.cr-finish-sub   { font-family:var(--fb); color:var(--muted); font-size:14px; margin:0 0 12px; }
+.cr-finish-btn   { margin-top:20px; }
+.cr-finish-score { display:flex; flex-direction:column; align-items:center; gap:14px; margin:8px 0 4px; }
+.cr-finish-fb    { font-family:var(--fb); font-size:14px; color:rgba(255,255,255,.55); line-height:1.7; max-width:380px; text-align:center; }
 
-  .cr-switch-card {
-    background:linear-gradient(145deg,#1a1f32 0%,#141828 100%);
-    border:1px solid var(--border-bright); border-radius:var(--radius);
-    padding:52px 44px; text-align:center; max-width:380px; width:100%;
-    box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 24px 56px rgba(0,0,0,.55);
-    display:flex; flex-direction:column; align-items:center; gap:14px;
-  }
-  .cr-switch-icon-wrap {
-    width:62px; height:62px; border-radius:50%;
-    background:var(--accent-dim); border:1px solid var(--border-accent);
-    display:flex; align-items:center; justify-content:center; margin-bottom:6px;
-  }
-  .cr-switch-title { font-family:var(--font-display); font-size:26px; font-weight:700; margin:0; color:var(--text); }
-  .cr-switch-sub   { font-family:var(--font-body); color:var(--text-muted); font-size:14px; margin:0; line-height:1.6; }
-  .cr-switch-sub strong { color:var(--accent); font-weight:500; }
-
-  .cr-finish-wide { display:flex; flex-direction:column; gap:20px; width:100%; max-width:680px; }
-  .cr-finish-card {
-    background:linear-gradient(145deg,#1a1f32 0%,#141828 100%);
-    border:1px solid var(--border-bright); border-radius:var(--radius);
-    padding:52px 48px; text-align:center; width:100%;
-    box-shadow:0 0 0 1px rgba(255,255,255,.04) inset,0 32px 72px rgba(0,0,0,.6);
-    display:flex; flex-direction:column; align-items:center; gap:8px;
-  }
-  .cr-finish-confetti { font-size:52px; margin-bottom:8px; }
-  .cr-finish-title    { font-family:var(--font-display); font-size:40px; font-weight:800; margin:0; color:var(--text); letter-spacing:-1px; }
-  .cr-finish-sub      { font-family:var(--font-body); color:var(--text-muted); font-size:14px; margin:0 0 12px; }
-  .cr-finish-btn      { margin-top:20px; }
-  .cr-finish-summary  { display:flex; flex-direction:column; align-items:center; gap:14px; margin:8px 0 4px; }
-  .cr-finish-score-wrap    { display:flex; }
-  .cr-finish-feedback-text { font-family:var(--font-body); font-size:14px; color:rgba(255,255,255,.55); line-height:1.7; max-width:380px; text-align:center; }
-
-  .cr-modal-overlay {
-    position:fixed; inset:0;
-    background:rgba(6,8,16,.88);
-    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
-    display:flex; align-items:center; justify-content:center;
-    z-index:999; padding:24px;
-  }
-  .cr-modal-card {
-    background:linear-gradient(145deg,#1c2036 0%,#161926 100%);
-    border:1px solid var(--border-bright); border-radius:var(--radius);
-    padding:38px 34px; text-align:center; max-width:380px; width:100%;
-    box-shadow:0 0 0 1px rgba(255,255,255,.05) inset,0 40px 80px rgba(0,0,0,.7);
-    animation:modalIn .22s ease;
-  }
-  .cr-modal-icon-wrap {
-    width:58px; height:58px; border-radius:50%;
-    background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.2);
-    display:flex; align-items:center; justify-content:center; margin:0 auto 20px;
-  }
-  .cr-modal-title   { font-family:var(--font-display); font-size:20px; font-weight:700; margin:0 0 10px; color:var(--text); }
-  .cr-modal-body    { font-family:var(--font-body); color:var(--text-muted); font-size:14px; line-height:1.65; margin:0; }
-  .cr-modal-actions { display:flex; gap:10px; margin-top:26px; }
-  .cr-modal-confirm {
-    flex:1; background:rgba(255,77,77,.1); color:var(--red);
-    border:1px solid rgba(255,77,77,.25); font-family:var(--font-display);
-    font-size:13px; font-weight:700; padding:13px; border-radius:var(--radius-sm);
-    cursor:pointer; transition:background .2s;
-  }
-  .cr-modal-confirm:hover { background:rgba(255,77,77,.2); }
-  .cr-modal-cancel {
-    flex:1; background:var(--surface2); color:var(--text-muted);
-    border:1px solid var(--border-bright); font-family:var(--font-display);
-    font-size:13px; font-weight:700; padding:13px; border-radius:var(--radius-sm);
-    cursor:pointer; transition:all .2s;
-  }
-  .cr-modal-cancel:hover { background:var(--surface3); color:var(--text); }
+/* Modal */
+.cr-modal-overlay { position:fixed; inset:0; background:rgba(6,8,16,.88); backdrop-filter:blur(12px); display:flex; align-items:center; justify-content:center; z-index:999; padding:24px; }
+.cr-modal         { background:linear-gradient(145deg,#1c2036,#161926); border:1px solid var(--border-b); border-radius:var(--r); padding:38px 34px; text-align:center; max-width:380px; width:100%; box-shadow:0 0 0 1px rgba(255,255,255,.05) inset,0 40px 80px rgba(0,0,0,.7); animation:cr-modal-in .22s ease; }
+.cr-modal-icon    { width:58px; height:58px; border-radius:50%; background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.2); display:flex; align-items:center; justify-content:center; margin:0 auto 20px; }
+.cr-modal-title   { font-family:var(--fd); font-size:20px; font-weight:700; margin:0 0 10px; color:var(--text); }
+.cr-modal-body    { font-family:var(--fb); color:var(--muted); font-size:14px; line-height:1.65; margin:0; }
+.cr-modal-btns    { display:flex; gap:10px; margin-top:26px; }
+.cr-modal-yes     { flex:1; background:rgba(255,77,77,.1); color:var(--red); border:1px solid rgba(255,77,77,.25); font-family:var(--fd); font-size:13px; font-weight:700; padding:13px; border-radius:var(--rs); cursor:pointer; transition:background .2s; }
+.cr-modal-yes:hover { background:rgba(255,77,77,.2); }
+.cr-modal-no      { flex:1; background:var(--surface2); color:var(--muted); border:1px solid var(--border-b); font-family:var(--fd); font-size:13px; font-weight:700; padding:13px; border-radius:var(--rs); cursor:pointer; transition:all .2s; }
+.cr-modal-no:hover { background:var(--surface3); color:var(--text); }
 `;
