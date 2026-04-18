@@ -94,10 +94,49 @@ const PREP_SEC  = 30;
 const SPEAK_SEC = 180;
 const OA_KEY    = import.meta.env.VITE_OPENAI_API_KEY;
 
-const AI_SYSTEM = `You are a professional German language tutor for B2 level.
-Analyze the transcript. Return ONLY a valid JSON object — no markdown, no prose.
-Schema: {"score":<int 2-5>,"correctedText":"<full corrected text>","feedback":"<2-3 sentences in German>","errors":[{"original":"<wrong>","correction":"<correct>","explanation":"<brief German explanation>"}]}
-Score: 5=fluent 4=good minor issues 3=understandable noticeable errors 2=basic many errors`;
+const AI_SYSTEM = `You are a strict German language examiner for B2 Beruf oral exams.
+
+You receive TWO inputs:
+1. TASK — the question/prompt the candidate was given
+2. RESPONSE — what the candidate actually said
+
+Your job is to evaluate BOTH dimensions equally:
+
+━━━ DIMENSION 1: RELEVANCE (50% of score) ━━━
+- Does the response DIRECTLY address the task?
+- Does it stay on topic throughout?
+- Does it answer what was actually asked?
+- If the response is off-topic, tangential, or ignores the task → score MUST be 2, regardless of grammar.
+- Flag off-topic responses explicitly in feedback.
+
+━━━ DIMENSION 2: LANGUAGE (50% of score) ━━━
+- Grammar correctness (B2 level structures)
+- Vocabulary range and appropriateness
+- Fluency and coherence
+
+━━━ SCORING RULES ━━━
+5 = On-topic AND fluent, minor or no errors
+4 = On-topic AND good, some noticeable errors
+3 = Partially on-topic OR understandable but many errors
+2 = Off-topic OR very poor language (even if grammatically correct sentences appear)
+NOTE: A grammatically perfect but off-topic answer MUST score 2.
+
+Return ONLY a valid JSON object — no markdown, no prose, no explanation outside JSON.
+
+Schema:
+{
+  "score": <int 2-5>,
+  "isOffTopic": <boolean — true if response does not address the task>,
+  "correctedText": "<full corrected version of what they said, keeping their meaning>",
+  "feedback": "<2-3 sentences in German — mention relevance first, then language quality>",
+  "errors": [
+    {
+      "original": "<wrong phrase>",
+      "correction": "<correct phrase>",
+      "explanation": "<brief explanation in German>"
+    }
+  ]
+}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -162,22 +201,19 @@ function sanitize(existing, chunk) {
 // ─────────────────────────────────────────────────────────────────────────────
 // OpenAI
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchAI(transcript) {
+async function fetchAI(transcript, question) {
   if (!OA_KEY || !transcript?.trim()) return null;
+  const userContent = question
+    ? `TASK:\n${question}\n\nRESPONSE:\n${transcript.trim()}`
+    : `RESPONSE:\n${transcript.trim()}`;
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method:"POST",
     headers:{"Content-Type":"application/json", Authorization:`Bearer ${OA_KEY}`},
     body:JSON.stringify({
       model:"gpt-4o-mini", max_tokens:900, temperature:0.25,
-      messages:[{role:"system",content:AI_SYSTEM},{role:"user",content:transcript.trim()}],
+      messages:[{role:"system",content:AI_SYSTEM},{role:"user",content:userContent}],
     }),
   });
-  if (!res.ok) throw new Error(`OpenAI ${res.status}`);
-  const data = await res.json();
-  const raw  = data.choices?.[0]?.message?.content || "";
-  try   { return JSON.parse(raw.replace(/```json|```/g,"").trim()); }
-  catch { console.error("AI JSON parse:", raw); return null; }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Speech Recognition Hook
@@ -323,9 +359,12 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
   return (
     <div className="rc-card" style={{animationDelay:"0ms"}}>
       {/* Header */}
-      <div className="rc-head">
-        <span className="rc-round-tag">Runde {roundNum}</span>
-        <span className="rc-who">{speakerName}</span>
+     <div className="rc-head">
+  <span className="rc-round-tag">Runde {roundNum}</span>
+  {result.isOffTopic && (
+    <span className="rc-offtopic-badge">⚠ Off-topic</span>
+  )}
+  <span className="rc-who">{speakerName}</span>
         <div className="rc-score-bar">
           {[1,2,3,4,5].map(b=>(
             <div key={b} className={`rc-bar-seg${b<=score?" rc-bar-on":""}`}
@@ -730,8 +769,8 @@ export default function ChallengeRoom({
     anim();
 
     try {
-      const result=await fetchAI(finalText);
-      if (result) {
+	const result=await fetchAI(finalText, currentQ?.question);   
+   if (result) {
         const payload={...result,transcript:finalText,speakerUid:me.uid};
         // I-3: write to results/round{N} — both clients' listeners pick it up
         if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`,payload);
