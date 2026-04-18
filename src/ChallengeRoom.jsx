@@ -214,7 +214,7 @@ async function fetchAI(transcript, question) {
       messages:[{role:"system",content:AI_SYSTEM},{role:"user",content:userContent}],
     }),
   });
-
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Speech Recognition Hook
 // ─────────────────────────────────────────────────────────────────────────────
