@@ -856,8 +856,13 @@ export default function ChallengeRoom({
   const masterEndsAtRef = useRef(null);
   const currentQRef     = useRef(null);
 
+  // Keep rsRef always in sync with the latest committed rs state.
+  // handleNextRound reads rsRef.current so it always gets the absolute
+  // latest currentSpeaker even if React hasn't re-rendered yet.
   useEffect(() => { rsRef.current = rs; }, [rs]);
   useEffect(() => { partnerUidRef.current = partnerUid; }, [partnerUid]);
+  // playersRef mirrors the players state so async handlers that close over
+  // the ref (not the state) always see the current A/B slot data.
   useEffect(() => { playersRef.current = players; }, [players]);
   useEffect(() => () => clearInterval(masterTimerRef.current), []);
 
@@ -1238,47 +1243,91 @@ export default function ChallengeRoom({
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // FIX 1: Dynamic Round-Robin Rotation
+  // ─────────────────────────────────────────────────────────────────────────
+  // handleNextRound — Explicit A/B Toggle
   //
-  // Derives next speaker from the live `players` object (slots A / B).
-  // This ensures correct alternation regardless of join order and avoids
-  // the stale static array that caused the original bug.
+  // Step 1  Read players from playersRef (synced by useEffect on every Firebase
+  //         push). Fall back to a live Firebase get() if either slot is missing.
+  //
+  // Step 2  Read currentSpeaker from rsRef.current — this ref is kept in sync
+  //         by its own useEffect and always holds the latest committed value
+  //         even if the React render cycle has not completed yet.
+  //
+  // Step 3  Explicit toggle:
+  //           currentSpeaker === players.A.uid  →  nextSpeaker = players.B.uid
+  //           otherwise                         →  nextSpeaker = players.A.uid
+  //
+  // Step 4  Write all four fields to Firebase in a single fbUpdate call so
+  //         both clients receive the complete new state atomically.
   // ─────────────────────────────────────────────────────────────────────────
   async function handleNextRound() {
     if (!amSpeaker) return;
 
-    const nextRound = rsRef.current.round + 1;
+    // rsRef is always current (kept in sync by useEffect) — reading it here
+    // gives us the latest committed values without waiting for re-render.
+    const currentSpeaker = rsRef.current.currentSpeaker;
+    const nextRound      = rsRef.current.round + 1;
     let nextSpeaker;
 
-    if (isMulti) {
-      // Derive the two UIDs from the live players map
-      const pl      = playersRef.current || {};
-      const uidA    = pl.A?.uid;
-      const uidB    = pl.B?.uid;
-      const current = rsRef.current.currentSpeaker;
+    if (isMulti && roomId) {
+      // ── Step 1: resolve the authoritative players object ──────────────────
+      // Primary: playersRef is mirrored from the Firebase listener (fast, no I/O).
+      let pl = playersRef.current || {};
+
+      // Safety net: if either A or B slot is missing, do a one-shot Firebase
+      // read to get ground truth and repopulate the ref for future calls.
+      if (!pl.A?.uid || !pl.B?.uid) {
+        try {
+          const db = await getDB();
+          if (db) {
+            const { ref: fbRef, get } = await import("firebase/database");
+            const snap = await get(fbRef(db, `rooms/${roomId}/players`));
+            if (snap.exists()) {
+              pl = snap.val();
+              playersRef.current = pl; // keep ref warm for subsequent calls
+            }
+          }
+        } catch (e) {
+          console.warn("handleNextRound: Firebase players read failed:", e);
+        }
+      }
+
+      const uidA = pl.A?.uid;
+      const uidB = pl.B?.uid;
 
       if (uidA && uidB) {
-        // Flip: if current is A → next is B, and vice versa
-        nextSpeaker = current === uidA ? uidB : uidA;
+        // ── Step 3: explicit A/B toggle ──────────────────────────────────────
+        nextSpeaker = currentSpeaker === uidA ? uidB : uidA;
       } else {
-        // Fallback: use partnerUid if only one slot resolved
+        // Last-resort: use partnerUidRef if only one slot resolved
+        console.warn("handleNextRound: A/B UIDs incomplete, falling back to partnerUidRef");
         nextSpeaker = partnerUidRef.current || me.uid;
       }
+
+      // ── Step 4: single atomic RTDB PATCH ─────────────────────────────────
+      // Use fbUpdate directly (not the pushRS wrapper) to guarantee all four
+      // fields land in one operation — no partial-state window between clients.
+      await fbUpdate(`rooms/${roomId}/roomState`, {
+        currentSpeaker: nextSpeaker,
+        round:          nextRound,
+        status:         "switching",
+        timerEndsAt:    null,
+      });
+
     } else {
-      // Solo: always me
+      // Solo mode: speaker never changes, just advance the round locally.
       nextSpeaker = me.uid;
+      setRs((prev) => ({
+        ...prev,
+        currentSpeaker: nextSpeaker,
+        round:          nextRound,
+        status:         "switching",
+        timerEndsAt:    null,
+      }));
     }
 
-    // Push the flip to Firebase atomically so both clients see the new speaker
-    await pushRS({
-      status:         "switching",
-      round:          nextRound,
-      currentSpeaker: nextSpeaker,
-      timerEndsAt:    null,
-    });
     anim();
   }
-
   async function handleStartMyRound() {
     if (!amSpeaker) return;
     await beginPrep(me.uid, rsRef.current.round);
