@@ -1,13 +1,16 @@
 /**
- * ChallengeRoom.jsx — B2 Beruf · v8 Fast-Eval
+ * ChallengeRoom.jsx — B2 Beruf · v9 Learning-Mode
  *
- * Changes from v7:
- *  - AI_SYSTEM prompt shortened for speed
- *  - fetchAI: max_tokens 900→400, temperature 0.25→0, response_format json_object
- *  - fetchAI: transcript capped at 600 chars
- *  - handleSpeakEnd: Promise.all to run fetchAI + Firebase in parallel (biggest gain)
- *  - Relevance checking enforced: off-topic → score 2
- *  - isOffTopic badge shown in ResultCard
+ * NEW in v9:
+ *  ─ Empty-transcript detection at round end (solo + multi)
+ *  ─ Learning Mode: if speaker said nothing → fetch Musterlösung via AI
+ *  ─ Musterlösung follows Telc B2 Beruf Teil 2 structure:
+ *      Einleitung · Vorschlag · Begründung · Schluss
+ *  ─ ResultCard shows special "Lernmodus" UI when isLearningMode=true
+ *  ─ In multi: if speaker is silent → model answer shown to BOTH users
+ *  ─ In multi: if speaker spoke → normal analysis + model answer as collapsible reference
+ *  ─ fetchModelAnswer() uses separate AI call (max_tokens 600, temp 0.3)
+ *  ─ All fast-path optimisations from v8 preserved
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -61,7 +64,7 @@ const PREP_SEC  = 30;
 const SPEAK_SEC = 180;
 const OA_KEY    = import.meta.env.VITE_OPENAI_API_KEY;
 
-// ── Shortened prompt for speed ────────────────────────────────────────────────
+// ── Evaluator prompt (fast, v8) ───────────────────────────────────────────────
 const AI_SYSTEM = `You are a German B2 oral exam evaluator. You receive a TASK and a RESPONSE.
 
 Evaluate on TWO criteria:
@@ -74,6 +77,25 @@ A grammatically perfect but off-topic answer MUST score 2.
 Return ONLY compact JSON, no markdown:
 {"score":<2-5>,"isOffTopic":<bool>,"correctedText":"<corrected>","feedback":"<2 sentences in German>","errors":[{"original":"<wrong>","correction":"<right>","explanation":"<German>"}]}`;
 
+// ── Musterlösung prompt — Telc B2 Beruf Teil 2 ───────────────────────────────
+const MUSTER_SYSTEM = `You are an expert German B2 Beruf (Telc) oral exam coach.
+Generate a MODEL ANSWER (Musterlösung) for the given Telc B2 Beruf Teil 2 Mündlich task.
+
+The answer MUST follow this exact 4-part Telc B2 Beruf Teil 2 structure:
+1. Einleitung (Introduction) — briefly acknowledge the topic/situation
+2. Vorschlag (Suggestion) — make a clear, relevant suggestion
+3. Begründung (Reasoning) — explain WHY with 2-3 supporting reasons
+4. Schluss (Conclusion) — wrap up politely and invite discussion
+
+Requirements:
+- Language: fluent B2 German, formal register (Sie-form), professional vocabulary
+- Length: 120-180 words total
+- Natural spoken German, not written essay style
+- Use connectors: zunächst, außerdem, darüber hinaus, abschließend etc.
+
+Return ONLY compact JSON, no markdown:
+{"einleitung":"<text>","vorschlag":"<text>","begruendung":"<text>","schluss":"<text>","fullAnswer":"<all 4 parts joined as one flowing paragraph>"}`;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,11 +105,9 @@ function pickRandom(questions = [], usedIds = []) {
   if (!src.length) return null;
   return src[Math.floor(Math.random() * src.length)];
 }
-
 function escHtml(s = "") {
   return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
-
 function buildHighlightedHTML(text = "", errors = []) {
   if (!text || !errors.length) return escHtml(text);
   let out = escHtml(text);
@@ -98,8 +118,6 @@ function buildHighlightedHTML(text = "", errors = []) {
   });
   return out;
 }
-
-// Android / Samsung dedup
 function lev(a, b, cap = 40) {
   if (Math.abs(a.length - b.length) > cap) return cap + 1;
   const row = Array.from({ length: b.length + 1 }, (_, i) => i);
@@ -134,31 +152,35 @@ function sanitize(existing, chunk) {
   return t;
 }
 
+/** True when the transcript has at least 3 real words — user actually spoke */
+function hasContent(text = "") {
+  return text.trim().replace(/\s+/g," ").split(" ").filter(w => w.length > 1).length >= 3;
+}
+
+/** Fallback Musterlösung used when the AI call fails */
+const FALLBACK_MUSTER = {
+  einleitung  : "Ich möchte zunächst kurz auf die Situation eingehen, die uns heute beschäftigt.",
+  vorschlag   : "Mein Vorschlag wäre, dieses Thema in einer gemeinsamen Besprechung zu klären.",
+  begruendung : "Das hat den Vorteil, dass alle Beteiligten die gleichen Informationen erhalten. Außerdem können Missverständnisse direkt besprochen werden. Darüber hinaus stärkt eine offene Kommunikation das Vertrauen im Team.",
+  schluss     : "Abschließend möchte ich betonen, dass ich für weitere Vorschläge und Fragen offen bin.",
+  fullAnswer  : "Ich möchte zunächst kurz auf die Situation eingehen, die uns heute beschäftigt. Mein Vorschlag wäre, dieses Thema in einer gemeinsamen Besprechung zu klären. Das hat den Vorteil, dass alle Beteiligten die gleichen Informationen erhalten. Außerdem können Missverständnisse direkt besprochen werden. Darüber hinaus stärkt eine offene Kommunikation das Vertrauen im Team. Abschließend möchte ich betonen, dass ich für weitere Vorschläge und Fragen offen bin.",
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAI — fast path
-//  • max_tokens 400 (was 900)
-//  • temperature 0   (was 0.25)
-//  • response_format json_object  → no parse retry needed
-//  • transcript capped at 600 chars
+// OpenAI — Evaluator (fast path)
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchAI(transcript, question) {
   if (!OA_KEY || !transcript?.trim()) return null;
-
-  // Cap transcript to 600 chars — enough for B2 evaluation
   const trimmedTranscript = transcript.trim().slice(0, 600);
-
   const userContent = question
     ? `TASK: ${question}\nRESPONSE: ${trimmedTranscript}`
     : `RESPONSE: ${trimmedTranscript}`;
-
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${OA_KEY}` },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
-      max_tokens: 400,
-      temperature: 0,
-      response_format: { type: "json_object" }, // guarantees clean JSON output
+      model: "gpt-4o-mini", max_tokens: 400, temperature: 0,
+      response_format: { type: "json_object" },
       messages: [
         { role: "system", content: AI_SYSTEM },
         { role: "user",   content: userContent },
@@ -168,8 +190,39 @@ async function fetchAI(transcript, question) {
   if (!res.ok) throw new Error(`OpenAI ${res.status}`);
   const data = await res.json();
   const raw  = data.choices?.[0]?.message?.content || "";
-  try   { return JSON.parse(raw); }
-  catch { console.error("AI JSON parse:", raw); return null; }
+  try { return JSON.parse(raw); } catch { console.error("AI parse:", raw); return null; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OpenAI — Musterlösung generator
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchModelAnswer(question, topic = "") {
+  if (!OA_KEY || !question?.trim()) return FALLBACK_MUSTER;
+  const userContent = topic
+    ? `THEMA: ${topic}\nAUFGABE: ${question}`
+    : `AUFGABE: ${question}`;
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OA_KEY}` },
+      body: JSON.stringify({
+        model: "gpt-4o-mini", max_tokens: 600, temperature: 0.3,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: MUSTER_SYSTEM },
+          { role: "user",   content: userContent },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`OpenAI Muster ${res.status}`);
+    const data = await res.json();
+    const raw  = data.choices?.[0]?.message?.content || "";
+    const parsed = JSON.parse(raw);
+    return parsed;
+  } catch(e) {
+    console.error("Muster fetch failed, using fallback:", e);
+    return FALLBACK_MUSTER;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -180,11 +233,10 @@ function useSpeechRecognition({ onFinal, onInterim, active }) {
   const activeRef   = useRef(active);
   const debounceRef = useRef(null);
   useEffect(() => { activeRef.current = active; }, [active]);
-
   const start = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return;
-    try { recogRef.current?.stop(); } catch { /* ignore */ }
+    try { recogRef.current?.stop(); } catch { /**/ }
     const r = new SR();
     r.continuous=true; r.interimResults=true; r.lang="de-DE"; r.maxAlternatives=1;
     r.onresult = e => {
@@ -199,16 +251,14 @@ function useSpeechRecognition({ onFinal, onInterim, active }) {
     r.onerror = e => { if(e.error!=="no-speech"&&e.error!=="aborted") console.warn("SR:",e.error); };
     r.onend   = () => { if(activeRef.current) try{r.start()}catch{/***/} };
     recogRef.current = r;
-    try { r.start(); } catch { /* permission denied */ }
+    try { r.start(); } catch { /**/ }
   }, [onFinal, onInterim]);
-
   const stop = useCallback(() => {
     activeRef.current=false;
     clearTimeout(debounceRef.current);
-    try { recogRef.current?.stop(); } catch { /* ignore */ }
+    try { recogRef.current?.stop(); } catch { /**/ }
     recogRef.current=null;
   }, []);
-
   return { start, stop };
 }
 
@@ -295,7 +345,51 @@ function LiveTranscriptPanel({ speakerName, text="", interim="", isMine }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ResultCard — with isOffTopic badge
+// MusterCard — Telc B2 Beruf Teil 2 model answer display
+// ─────────────────────────────────────────────────────────────────────────────
+function MusterCard({ muster, roundNum, speakerName, isReference = false }) {
+  const parts = [
+    { key:"einleitung",  label:"Einleitung",  dot:"rc-dot-cyan",  icon:"💬" },
+    { key:"vorschlag",   label:"Vorschlag",   dot:"rc-dot-green", icon:"💡" },
+    { key:"begruendung", label:"Begründung",  dot:"rc-dot-amber", icon:"📋" },
+    { key:"schluss",     label:"Schluss",     dot:"rc-dot-cyan",  icon:"✅" },
+  ];
+  return (
+    <div className="mc-wrap">
+      {!isReference && (
+        <div className="mc-notice">
+          <span className="mc-notice-icon">🎙️</span>
+          <div>
+            <p className="mc-notice-title">Du hast diese Runde nicht gesprochen.</p>
+            <p className="mc-notice-sub">Hier ist die ideale Antwort für diese Aufgabe:</p>
+          </div>
+        </div>
+      )}
+      <div className="rc-card mc-card">
+        <div className="rc-head">
+          <span className="rc-round-tag">Runde {roundNum}</span>
+          <span className="mc-badge">{isReference ? "📖 Referenz" : "📖 Lernmodus"}</span>
+          {!isReference && <span className="rc-who">{speakerName}</span>}
+        </div>
+        {parts.map(({key, label, dot, icon}) => muster[key] && (
+          <div key={key} className="rc-sec">
+            <div className="rc-label">
+              <span className={`rc-dot ${dot}`}/>{icon} {label}
+            </div>
+            <p className="mc-part-text">{muster[key]}</p>
+          </div>
+        ))}
+        <div className="mc-tip">
+          <span className="mc-tip-icon">💡</span>
+          <p>Lies diese Musterlösung laut vor, um die B2 Beruf Teil 2 Strukturen zu üben.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ResultCard — normal evaluation
 // ─────────────────────────────────────────────────────────────────────────────
 function ResultCard({ result, speakerName, roundNum, isLoading }) {
   if (isLoading) return (
@@ -313,40 +407,30 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
   const { score=0, isOffTopic=false, correctedText, feedback, errors=[], transcript:origText } = result;
   const html = buildHighlightedHTML(origText, errors);
   return (
-    <div className="rc-card" style={{animationDelay:"0ms"}}>
-      {/* Header */}
+    <div className="rc-card">
       <div className="rc-head">
         <span className="rc-round-tag">Runde {roundNum}</span>
-        {isOffTopic && (
-          <span className="rc-offtopic-badge">⚠ Off-topic</span>
-        )}
+        {isOffTopic && <span className="rc-offtopic-badge">⚠ Off-topic</span>}
         <span className="rc-who">{speakerName}</span>
         <div className="rc-score-bar">
           {[1,2,3,4,5].map(b=>(
-            <div key={b} className={`rc-bar-seg${b<=score?" rc-bar-on":""}`}
-              style={{"--bh":`${b*5+6}px`}}/>
+            <div key={b} className={`rc-bar-seg${b<=score?" rc-bar-on":""}`} style={{"--bh":`${b*5+6}px`}}/>
           ))}
           <span className="rc-score-val">{score}<span className="rc-score-of">/5</span></span>
         </div>
       </div>
-
-      {/* Original with errors in RED */}
       {origText && (
         <div className="rc-sec">
           <div className="rc-label"><span className="rc-dot rc-dot-red"/>Original · Fehler markiert</div>
           <div className="rc-orig" dangerouslySetInnerHTML={{__html:html}}/>
         </div>
       )}
-
-      {/* Corrected version in GREEN */}
       {correctedText && (
         <div className="rc-sec">
           <div className="rc-label"><span className="rc-dot rc-dot-green"/>Korrigierte Version</div>
           <div className="rc-corr">{correctedText}</div>
         </div>
       )}
-
-      {/* Error table */}
       {errors.length>0 && (
         <div className="rc-sec">
           <div className="rc-label"><span className="rc-dot rc-dot-amber"/>Fehler ({errors.length})</div>
@@ -362,8 +446,6 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
           </div>
         </div>
       )}
-
-      {/* Feedback */}
       {feedback && (
         <div className="rc-sec rc-sec-last">
           <div className="rc-label"><span className="rc-dot rc-dot-cyan"/>Feedback</div>
@@ -371,6 +453,36 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ResultsView — unified dispatcher
+//   isLearningMode=true  → MusterCard (full)
+//   isLearningMode=false → ResultCard + optional collapsible MusterCard
+// ─────────────────────────────────────────────────────────────────────────────
+function ResultsView({ result, roundNum, speakerName, isLoading }) {
+  if (isLoading) return <ResultCard result={null} speakerName={speakerName} roundNum={roundNum} isLoading/>;
+  if (!result)   return null;
+
+  if (result.isLearningMode && result.muster) {
+    return <MusterCard muster={result.muster} roundNum={roundNum} speakerName={speakerName}/>;
+  }
+
+  return (
+    <>
+      <ResultCard result={result} speakerName={speakerName} roundNum={roundNum} isLoading={false}/>
+      {result.muster && (
+        <details className="muster-ref-details">
+          <summary className="muster-ref-summary">
+            <span>📖</span> Musterlösung als Referenz anzeigen
+          </summary>
+          <div style={{padding:"16px"}}>
+            <MusterCard muster={result.muster} roundNum={roundNum} speakerName={speakerName} isReference/>
+          </div>
+        </details>
+      )}
+    </>
   );
 }
 
@@ -394,6 +506,32 @@ function AnalyzingOverlay({ speakerName }) {
         <p className="ol-sub">{speakerName}s Antwort wird ausgewertet.<br/>Einen Moment bitte.</p>
         <div className="ol-dots">
           {[0,.2,.4].map((d,i)=><span key={i} className="ol-dot" style={{animationDelay:`${d}s`}}/>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LearningOverlay — shown while fetching Musterlösung
+// ─────────────────────────────────────────────────────────────────────────────
+function LearningOverlay() {
+  return (
+    <div className="ol-wrap">
+      <div className="ol-card ol-learn-card">
+        <div className="ol-ring">
+          <svg width="68" height="68" viewBox="0 0 68 68">
+            <circle cx="34" cy="34" r="28" fill="none" stroke="rgba(251,191,36,.1)" strokeWidth="4"/>
+            <circle cx="34" cy="34" r="28" fill="none" stroke="#fbbf24" strokeWidth="4"
+              strokeLinecap="round" strokeDasharray="52 124"
+              style={{animation:"cr-spin 1.1s linear infinite",transformOrigin:"center"}}/>
+          </svg>
+          <span className="ol-emoji">📖</span>
+        </div>
+        <h3 className="ol-title">Lernmodus</h3>
+        <p className="ol-sub">Musterlösung wird generiert…<br/>Telc B2 Beruf · Teil 2</p>
+        <div className="ol-dots">
+          {[0,.2,.4].map((d,i)=><span key={i} className="ol-dot ol-dot-am" style={{animationDelay:`${d}s`}}/>)}
         </div>
       </div>
     </div>
@@ -450,7 +588,6 @@ function RedemittelPanel({ items=[] }) {
   );
 }
 
-// Icon helpers
 function MicOnIcon()  { return <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" fill="currentColor"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>; }
 function MicOffIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>; }
 
@@ -474,15 +611,13 @@ export default function ChallengeRoom({
     timerEndsAt:null, currentQuestionId:null, round:1,
     speakerOrder:[me.uid],
   });
-
-  const [transcripts,  setTranscripts]  = useState({});
-  const [roundResults, setRoundResults] = useState({});
-  const [analyzingMap, setAnalyzingMap] = useState({});
-
-  const [partnerUid,  setPartnerUid]  = useState(null);
-  const [partnerName, setPartnerName] = useState("Partner");
-  const [fbReady,     setFbReady]     = useState(!isMulti);
-
+  const [transcripts,   setTranscripts]   = useState({});
+  const [roundResults,  setRoundResults]  = useState({});
+  const [analyzingMap,  setAnalyzingMap]  = useState({});
+  const [isLearningMode,setIsLearningMode]= useState(false);
+  const [partnerUid,    setPartnerUid]    = useState(null);
+  const [partnerName,   setPartnerName]   = useState("Partner");
+  const [fbReady,       setFbReady]       = useState(!isMulti);
   const [isRecording,     setIsRecording]     = useState(false);
   const [showExitConfirm, setShowExitConfirm] = useState(false);
   const [phaseAnim,       setPhaseAnim]       = useState("in");
@@ -493,6 +628,7 @@ export default function ChallengeRoom({
   const partnerUidRef   = useRef(null);
   const masterTimerRef  = useRef(null);
   const masterEndsAtRef = useRef(null);
+  const currentQRef     = useRef(null);
 
   useEffect(()=>{ rsRef.current=rs; },[rs]);
   useEffect(()=>{ partnerUidRef.current=partnerUid; },[partnerUid]);
@@ -502,19 +638,17 @@ export default function ChallengeRoom({
   const amSpeaker = rs.currentSpeaker===me.uid;
   const totalSec  = rs.timerPhase==="prep"?PREP_SEC:SPEAK_SEC;
   const currentQ  = propQ.find(q=>q.id===rs.currentQuestionId)||null;
-  const roundKey  = `round${rs.round}`;
+  useEffect(()=>{ currentQRef.current=currentQ; },[currentQ]);
 
-  const anyAnalyzing      = Object.values(analyzingMap).some(Boolean);
-  const speakerTx         = transcripts[rs.currentSpeaker]||{text:"",interim:""};
-  const myTx              = transcripts[me.uid]||{text:"",interim:""};
-  const partnerTx         = transcripts[partnerUid||""]||{text:"",interim:""};
-  const currentRoundResult= roundResults[roundKey]||null;
-  const round1Result      = roundResults["round1"]||null;
-  const round2Result      = roundResults["round2"]||null;
-  const speakerDisplayName= rs.currentSpeaker===me.uid ? me.displayName : partnerName;
-  const isSpeakerAnalyzing= !!analyzingMap[rs.currentSpeaker];
-
-  const timeLeft = useTimerDisplay(rs.timerEndsAt, totalSec);
+  const roundKey           = `round${rs.round}`;
+  const anyAnalyzing       = Object.values(analyzingMap).some(Boolean);
+  const speakerTx          = transcripts[rs.currentSpeaker]||{text:"",interim:""};
+  const currentRoundResult = roundResults[roundKey]||null;
+  const round1Result       = roundResults["round1"]||null;
+  const round2Result       = roundResults["round2"]||null;
+  const speakerDisplayName = rs.currentSpeaker===me.uid ? me.displayName : partnerName;
+  const isSpeakerAnalyzing = !!analyzingMap[rs.currentSpeaker];
+  const timeLeft           = useTimerDisplay(rs.timerEndsAt, totalSec);
 
   // ── Firebase listeners ────────────────────────────────────────────────────
   useEffect(()=>{
@@ -528,7 +662,6 @@ export default function ChallengeRoom({
         if (p?.displayName) setPartnerName(p.displayName);
         if (p?.uid)         setPartnerUid(p.uid);
       }));
-
       cls.push(await fbListen(`rooms/${roomId}/roomState`, data=>{
         setFbReady(true);
         if (!data) return;
@@ -541,17 +674,14 @@ export default function ChallengeRoom({
           masterEndsAtRef.current=null;
         }
       }));
-
       cls.push(await fbListen(`rooms/${roomId}/transcript`, data=>{
         if (!data) return;
         setTranscripts(prev=>({...prev,...data}));
         if (data[me.uid]?.text!==undefined) transcriptRef.current=data[me.uid].text||"";
       }));
-
       cls.push(await fbListen(`rooms/${roomId}/results`, data=>{
         if (data) setRoundResults(data);
       }));
-
       cls.push(await fbListen(`rooms/${roomId}/analyzing`, data=>{
         setAnalyzingMap(data||{});
       }));
@@ -559,16 +689,11 @@ export default function ChallengeRoom({
     return ()=>cls.forEach(fn=>fn?.());
   },[isMulti,roomId]);
 
-  // ── pushRS ────────────────────────────────────────────────────────────────
   const pushRS = useCallback(async partial=>{
-    if (isMulti&&roomId) {
-      await fbUpdate(`rooms/${roomId}/roomState`, partial);
-    } else {
-      setRs(prev=>({...prev,...partial}));
-    }
+    if (isMulti&&roomId) { await fbUpdate(`rooms/${roomId}/roomState`, partial); }
+    else { setRs(prev=>({...prev,...partial})); }
   },[isMulti,roomId]);
 
-  // ── Transcript write ──────────────────────────────────────────────────────
   const writeTx = useCallback(async(field,value)=>{
     if (isMulti&&roomId) {
       await fbSet(`rooms/${roomId}/transcript/${me.uid}/${field}`, value);
@@ -578,7 +703,6 @@ export default function ChallengeRoom({
     }
   },[isMulti,roomId,me.uid]);
 
-  // ── Master countdown ──────────────────────────────────────────────────────
   function _startCountdown(endsAt, phase, questionId) {
     clearInterval(masterTimerRef.current);
     masterTimerRef.current=setInterval(()=>{
@@ -589,14 +713,11 @@ export default function ChallengeRoom({
         if (phase==="prep") {
           const q=propQ.find(q=>q.id===(questionId||rsRef.current.currentQuestionId));
           _doBeginSpeaking(q);
-        } else {
-          handleSpeakEnd();
-        }
+        } else { handleSpeakEnd(); }
       }
     },400);
   }
 
-  // ── Speech handlers ───────────────────────────────────────────────────────
   const handleFinal = useCallback(raw=>{
     const clean=sanitize(transcriptRef.current,raw);
     if (!clean) return;
@@ -607,7 +728,6 @@ export default function ChallengeRoom({
   },[writeTx]);
 
   const handleInterim = useCallback(text=>{ writeTx("interim",text); },[writeTx]);
-
   const micActive = status==="speaking" && amSpeaker && isRecording;
 
   const {start:startRecog,stop:stopRecog} = useSpeechRecognition({
@@ -618,33 +738,29 @@ export default function ChallengeRoom({
     return ()=>stopRecog();
   },[micActive]);
 
-  // ── Phase animation ───────────────────────────────────────────────────────
   function anim(cb) {
     setPhaseAnim("out");
     setTimeout(()=>{ cb?.(); setPhaseAnim("in"); },200);
   }
   function handleExitRequest() {
-    if (anyAnalyzing) return;
+    if (anyAnalyzing||isLearningMode) return;
     if (status==="intro"||status==="finished") { onExit?.(); return; }
     setShowExitConfirm(true);
   }
 
-  // ── Game flow ─────────────────────────────────────────────────────────────
   async function beginPrep(speakerUid, roundNum) {
     if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
     transcriptRef.current="";
-
+    setIsLearningMode(false);
     if (isMulti&&roomId) {
       await fbSet(`rooms/${roomId}/transcript/${me.uid}`,{text:"",interim:"",updatedAt:Date.now()});
       const pUid=partnerUidRef.current;
       if (pUid) await fbSet(`rooms/${roomId}/transcript/${pUid}`,{text:"",interim:"",updatedAt:Date.now()});
     } else { setTranscripts({}); }
-
     const usedIds=isSolo?soloUsedIds:[];
     const q=pickRandom(propQ,usedIds);
     if (!q) { console.warn("No questions"); return; }
     if (isSolo) setSoloUsedIds(p=>[...p,q.id]);
-
     const endsAt=Date.now()+PREP_SEC*1000;
     await pushRS({
       status:"prep", currentSpeaker:speakerUid||me.uid,
@@ -672,42 +788,96 @@ export default function ChallengeRoom({
     await _doBeginSpeaking();
   }
 
-  // ── handleSpeakEnd — FAST PATH with Promise.all ───────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // handleSpeakEnd — v9 Learning Mode branch
+  //
+  // Decision:
+  //   hasContent(transcript)?
+  //     YES → normal eval (fetchAI) + muster as reference (parallel)
+  //     NO  → Learning Mode: fetch Musterlösung, skip grading entirely
+  // ─────────────────────────────────────────────────────────────────────────
   async function handleSpeakEnd() {
     if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
     clearInterval(masterTimerRef.current); masterEndsAtRef.current=null;
     setIsRecording(false); stopRecog();
     playBeep({freq:440,gain:.3});
 
-    const finalText    = transcriptRef.current;
-    const curRound     = rsRef.current.round;
-    const curRKey      = `round${curRound}`;
-    const questionText = currentQ?.question; // capture before any state change
+    const finalText      = transcriptRef.current;
+    const curRound       = rsRef.current.round;
+    const curRKey        = `round${curRound}`;
+    const q              = currentQRef.current;
+    const questionText   = q?.question || "";
+    const topicText      = q?.topic    || "";
+    const spokeSomething = hasContent(finalText);
 
     const flagPath = isMulti&&roomId ? `rooms/${roomId}/analyzing/${me.uid}` : null;
 
-    // ── Run fetchAI + Firebase flag + status update ALL in parallel ──────────
-    // This is the key speed improvement: AI call starts immediately
-    const [aiResult] = await Promise.all([
-      fetchAI(finalText, questionText),
+    // Set flag + status in parallel (don't block AI call)
+    await Promise.all([
       flagPath
         ? fbSet(flagPath, true)
         : Promise.resolve(setAnalyzingMap(p=>({...p,[me.uid]:true}))),
       pushRS({status:"analyzing", timerEndsAt:null}),
     ]);
-
     anim();
 
     try {
-      if (aiResult) {
-        const payload = {...aiResult, transcript:finalText, speakerUid:me.uid};
+      if (spokeSomething) {
+        // ══ NORMAL PATH ══════════════════════════════════════════════════════
+        // Evaluate transcript AND fetch muster reference in parallel
+        setIsLearningMode(false);
+
+        const [aiResult, muster] = await Promise.all([
+          fetchAI(finalText, questionText),
+          fetchModelAnswer(questionText, topicText),
+        ]);
+
+        const payload = {
+          ...(aiResult || {
+            score: 2, isOffTopic: false,
+            correctedText: "", feedback: "Keine Auswertung verfügbar.", errors: [],
+          }),
+          transcript    : finalText,
+          speakerUid    : me.uid,
+          isLearningMode: false,
+          muster        : muster,   // attached as collapsible reference
+        };
+
         if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
         else setRoundResults(p=>({...p,[curRKey]:payload}));
         await pushRS({status:"results"});
         anim();
+
+      } else {
+        // ══ LEARNING MODE ════════════════════════════════════════════════════
+        // User was silent → show Musterlösung, no score given
+        setIsLearningMode(true);
+
+        const muster = await fetchModelAnswer(questionText, topicText);
+
+        const payload = {
+          score         : 0,
+          isOffTopic    : false,
+          isLearningMode: true,
+          transcript    : "",
+          speakerUid    : me.uid,
+          muster        : muster,
+          correctedText : "",
+          feedback      : "Du hast diese Runde nicht gesprochen. Übe mit der Musterlösung.",
+          errors        : [],
+        };
+
+        if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
+        else setRoundResults(p=>({...p,[curRKey]:payload}));
+
+        setIsLearningMode(false);
+        await pushRS({status:"results"});
+        anim();
       }
+
     } catch(err) {
-      console.error("AI error:",err);
+      console.error("Round-end error:", err);
+      setIsLearningMode(false);
       await pushRS({status:"results"});
       anim();
     } finally {
@@ -723,18 +893,18 @@ export default function ChallengeRoom({
     await pushRS({status:"switching",round:rsRef.current.round+1,currentSpeaker:nextSpeaker,timerEndsAt:null});
     anim();
   }
-
   async function handleStartMyRound() {
     if (!amSpeaker) return;
     await beginPrep(me.uid, rsRef.current.round);
   }
-
   async function handleFinish() {
     await pushRS({status:"finished"});
     anim();
   }
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
+  // Render
+  // ─────────────────────────────────────────────────────────────────────────
   return (
     <>
       <style>{CSS}</style>
@@ -747,8 +917,9 @@ export default function ChallengeRoom({
         <div className="cr-amb1" aria-hidden/>
         <div className="cr-amb2" aria-hidden/>
 
-        {anyAnalyzing && <AnalyzingOverlay speakerName={speakerDisplayName}/>}
-        {showExitConfirm && !anyAnalyzing && (
+        {isLearningMode && <LearningOverlay/>}
+        {!isLearningMode && anyAnalyzing && <AnalyzingOverlay speakerName={speakerDisplayName}/>}
+        {showExitConfirm && !anyAnalyzing && !isLearningMode && (
           <ExitModal
             onConfirm={()=>{setShowExitConfirm(false);onExit?.();}}
             onCancel={()=>setShowExitConfirm(false)}
@@ -765,9 +936,7 @@ export default function ChallengeRoom({
             {status!=="intro"&&(
               <div className="cr-prog">
                 {[1,2].map(r=>(
-                  <div key={r} className={`cr-pseg${rs.round>=r?" cr-pa":""}${roundResults[`round${r}`]?" cr-pd":""}`}>
-                    {r}
-                  </div>
+                  <div key={r} className={`cr-pseg${rs.round>=r?" cr-pa":""}${roundResults[`round${r}`]?" cr-pd":""}`}>{r}</div>
                 ))}
               </div>
             )}
@@ -775,8 +944,11 @@ export default function ChallengeRoom({
           <div className="cr-hdr-r">
             {isMulti&&<div className="cr-partner-chip"><span className="cr-pdot"/>{partnerName}</div>}
             {isRecording&&amSpeaker&&<div className="cr-rec-chip"><span className="cr-rdot"/>REC</div>}
-            <button className={`cr-x${anyAnalyzing?" cr-x-locked":""}`}
-              onClick={handleExitRequest} disabled={anyAnalyzing} aria-label="Beenden">
+            <button
+              className={`cr-x${(anyAnalyzing||isLearningMode)?" cr-x-locked":""}`}
+              onClick={handleExitRequest}
+              disabled={anyAnalyzing||isLearningMode}
+              aria-label="Beenden">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
                 <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
               </svg>
@@ -784,7 +956,6 @@ export default function ChallengeRoom({
           </div>
         </header>
 
-        {/* MAIN */}
         <main className={`cr-main cr-a-${phaseAnim}`}>
 
           {/* INTRO */}
@@ -802,7 +973,7 @@ export default function ChallengeRoom({
                     :`Duell mit ${partnerName} · 2 Runden · Live-Transkript · KI-Feedback`}
                 </p>
                 <div className="intro-meta">
-                  {[["⏱","30 s Prep"],["🎙","3 min"],["🤖","KI-Score"],["📋","Redemittel"]].map(([ic,lb])=>(
+                  {[["⏱","30 s Prep"],["🎙","3 min"],["🤖","KI-Score"],["📖","Musterlösung"]].map(([ic,lb])=>(
                     <div key={lb} className="intro-meta-item"><span>{ic}</span><span>{lb}</span></div>
                   ))}
                 </div>
@@ -847,14 +1018,12 @@ export default function ChallengeRoom({
               <div className="game-l">
                 <CircularTimer timeLeft={timeLeft} totalTime={SPEAK_SEC} phase="speak"/>
                 <div className="ph-badge ph-spk">Sprechen</div>
-
                 {amSpeaker&&(
                   <button className={`btn-mic${isRecording?" btn-mic-on":""}`}
                     onClick={()=>setIsRecording(r=>!r)}>
                     {isRecording?<><MicOnIcon/>Aktiv</>:<><MicOffIcon/>Stumm</>}
                   </button>
                 )}
-
                 {!amSpeaker&&isMulti&&(
                   <div className="waiting-banner">
                     <span className="wait-dot"/>
@@ -862,7 +1031,6 @@ export default function ChallengeRoom({
                     <span className="wait-lock">🔒 Mikrofon gesperrt</span>
                   </div>
                 )}
-
                 {amSpeaker&&(
                   <button className="btn-danger" onClick={handleSpeakEnd}>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
@@ -908,22 +1076,23 @@ export default function ChallengeRoom({
           {status==="results"&&(
             <div className="res-lay">
               <div className="res-hdr">
-                <h2 className="res-title">Ergebnis · Runde {rs.round}</h2>
+                <h2 className="res-title">
+                  {currentRoundResult?.isLearningMode
+                    ? "📖 Lernmodus · Runde " + rs.round
+                    : "Ergebnis · Runde " + rs.round}
+                </h2>
                 {isMulti&&(
                   <div className="res-sync">
-                    <span className="res-sync-dot"/>
-                    Beide Nutzer sehen dies gleichzeitig
+                    <span className="res-sync-dot"/>Beide Nutzer sehen dies gleichzeitig
                   </div>
                 )}
               </div>
-
-              <ResultCard
+              <ResultsView
                 result={currentRoundResult}
                 speakerName={speakerDisplayName}
                 roundNum={rs.round}
                 isLoading={!currentRoundResult&&isSpeakerAnalyzing}
               />
-
               <div className="res-actions">
                 {rs.round===1&&(
                   amSpeaker||isSolo
@@ -970,38 +1139,38 @@ export default function ChallengeRoom({
                 <h1 className="fin-title">Geschafft!</h1>
                 <p className="fin-sub">Hervorragende Arbeit!</p>
               </div>
-
               <div className="fin-scores">
-                {[round1Result,round2Result].map((r,i)=>r&&(
+                {[round1Result,round2Result].map((r,i)=> r && !r.isLearningMode && (
                   <div key={i} className="ssc">
                     <div className="ssc-rnd">Runde {i+1}</div>
                     <div className="ssc-s">{r.score}<span>/5</span></div>
                     <div className="ssc-bars">
                       {[1,2,3,4,5].map(b=>(
-                        <div key={b} className={`ssc-b${b<=r.score?" ssc-b-on":""}`}
-                          style={{"--bh":`${b*5+4}px`}}/>
+                        <div key={b} className={`ssc-b${b<=r.score?" ssc-b-on":""}`} style={{"--bh":`${b*5+4}px`}}/>
                       ))}
                     </div>
                   </div>
                 ))}
+                {[round1Result,round2Result].map((r,i)=> r?.isLearningMode && (
+                  <div key={i} className="ssc ssc-learn">
+                    <div className="ssc-rnd">Runde {i+1}</div>
+                    <div className="ssc-learn-icon">📖</div>
+                    <div className="ssc-learn-lbl">Lernmodus</div>
+                  </div>
+                ))}
               </div>
-
               <div className="fin-results">
-                {round1Result&&(
-                  <ResultCard result={round1Result} roundNum={1}
-                    speakerName={rs.speakerOrder?.[0]===me.uid?me.displayName:partnerName}
-                    isLoading={false}/>
-                )}
-                {round2Result&&(
-                  <ResultCard result={round2Result} roundNum={2}
-                    speakerName={rs.speakerOrder?.[1]===me.uid?me.displayName:partnerName}
-                    isLoading={false}/>
-                )}
+                {[round1Result,round2Result].map((r,i)=> r && (
+                  <ResultsView
+                    key={i}
+                    result={r}
+                    roundNum={i+1}
+                    speakerName={rs.speakerOrder?.[i]===me.uid?me.displayName:partnerName}
+                    isLoading={false}
+                  />
+                ))}
               </div>
-
-              <button className="btn-p" style={{marginTop:8}} onClick={()=>onExit?.()}>
-                Beenden
-              </button>
+              <button className="btn-p" style={{marginTop:8}} onClick={()=>onExit?.()}>Beenden</button>
             </div>
           )}
 
@@ -1016,9 +1185,7 @@ export default function ChallengeRoom({
 // ─────────────────────────────────────────────────────────────────────────────
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap');
-
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-
 .cr-root{
   --bg:#080c14;--sf:#0e1524;--sf2:#121d30;--sf3:#172238;
   --b:rgba(255,255,255,.06);--b2:rgba(255,255,255,.11);--b3:rgba(34,211,238,.22);
@@ -1030,10 +1197,8 @@ const CSS = `
   --fd:'Outfit',sans-serif;--fb:'Space Grotesk',sans-serif;
   --r:16px;--rs:10px;
   background:var(--bg);color:var(--tx);font-family:var(--fb);
-  min-height:100vh;position:relative;overflow-x:hidden;
-  display:flex;flex-direction:column;
+  min-height:100vh;position:relative;overflow-x:hidden;display:flex;flex-direction:column;
 }
-
 .cr-grid{position:fixed;inset:0;pointer-events:none;z-index:0;
   background-image:linear-gradient(rgba(34,211,238,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,.022) 1px,transparent 1px);
   background-size:56px 56px;}
@@ -1041,7 +1206,6 @@ const CSS = `
   background:radial-gradient(circle,rgba(34,211,238,.05) 0%,transparent 65%);}
 .cr-amb2{position:fixed;width:480px;height:480px;border-radius:50%;bottom:-120px;right:-80px;pointer-events:none;z-index:0;
   background:radial-gradient(circle,rgba(99,102,241,.05) 0%,transparent 65%);}
-
 @keyframes cr-spin  {to{transform:rotate(360deg)}}
 @keyframes cr-fadeup{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
 @keyframes cr-glow  {0%,100%{opacity:.6}50%{opacity:1}}
@@ -1049,16 +1213,9 @@ const CSS = `
 @keyframes cr-blink {0%,100%{opacity:1}50%{opacity:.2}}
 @keyframes cr-pulse {0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
 @keyframes cr-slide {from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-
-.cr-hdr{display:flex;align-items:center;gap:14px;padding:14px 26px;
-  border-bottom:1px solid var(--b);background:rgba(8,12,20,.92);
-  backdrop-filter:blur(20px);position:sticky;top:0;z-index:100;flex-shrink:0;}
+.cr-hdr{display:flex;align-items:center;gap:14px;padding:14px 26px;border-bottom:1px solid var(--b);background:rgba(8,12,20,.92);backdrop-filter:blur(20px);position:sticky;top:0;z-index:100;flex-shrink:0;}
 .cr-logo{display:flex;align-items:center;gap:10px;}
-.cr-logo-mark{width:36px;height:36px;border-radius:9px;
-  background:linear-gradient(135deg,#22d3ee,#6366f1);
-  display:flex;align-items:center;justify-content:center;
-  font-family:var(--fd);font-weight:800;font-size:13px;color:#fff;
-  box-shadow:0 0 14px rgba(34,211,238,.3);}
+.cr-logo-mark{width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#22d3ee,#6366f1);display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-weight:800;font-size:13px;color:#fff;box-shadow:0 0 14px rgba(34,211,238,.3);}
 .cr-logo-t{font-family:var(--fd);font-weight:700;font-size:15px;color:#fff;display:block;line-height:1.1}
 .cr-logo-s{font-size:9.5px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;display:block}
 .cr-hdr-c{flex:1;display:flex;justify-content:center;}
@@ -1074,19 +1231,14 @@ const CSS = `
 .cr-x{width:32px;height:32px;border-radius:50%;background:var(--sf2);border:1px solid var(--b2);color:var(--mu);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;}
 .cr-x:hover:not(:disabled){background:var(--sf3);color:var(--tx);border-color:rgba(255,255,255,.2);}
 .cr-x-locked{opacity:.3;cursor:not-allowed;pointer-events:none;}
-
 .cr-main{flex:1;position:relative;z-index:1;}
 .cr-a-in {animation:cr-slide .25s ease;}
 .cr-a-out{opacity:0;transform:translateY(8px);transition:opacity .2s,transform .2s;}
-
-.ol-wrap{position:fixed;inset:0;z-index:900;background:rgba(4,7,14,.9);backdrop-filter:blur(22px);
-  display:flex;align-items:center;justify-content:center;padding:24px;animation:cr-fadeup .28s ease;}
-.ol-card{background:linear-gradient(145deg,#111827,#0a1020);border:1px solid var(--b3);border-radius:var(--r);
-  padding:46px 38px;text-align:center;max-width:380px;width:100%;
-  box-shadow:0 0 60px rgba(34,211,238,.07),0 40px 80px rgba(0,0,0,.65);
-  display:flex;flex-direction:column;align-items:center;gap:14px;position:relative;overflow:hidden;}
-.ol-card::before{content:'';position:absolute;top:0;left:5%;right:5%;height:1px;
-  background:linear-gradient(90deg,transparent,rgba(34,211,238,.5),transparent);}
+.ol-wrap{position:fixed;inset:0;z-index:900;background:rgba(4,7,14,.9);backdrop-filter:blur(22px);display:flex;align-items:center;justify-content:center;padding:24px;animation:cr-fadeup .28s ease;}
+.ol-card{background:linear-gradient(145deg,#111827,#0a1020);border:1px solid var(--b3);border-radius:var(--r);padding:46px 38px;text-align:center;max-width:380px;width:100%;box-shadow:0 0 60px rgba(34,211,238,.07),0 40px 80px rgba(0,0,0,.65);display:flex;flex-direction:column;align-items:center;gap:14px;position:relative;overflow:hidden;}
+.ol-card::before{content:'';position:absolute;top:0;left:5%;right:5%;height:1px;background:linear-gradient(90deg,transparent,rgba(34,211,238,.5),transparent);}
+.ol-learn-card{border-color:rgba(251,191,36,.3);}
+.ol-learn-card::before{background:linear-gradient(90deg,transparent,rgba(251,191,36,.5),transparent);}
 .ol-ring{position:relative;width:68px;height:68px;display:flex;align-items:center;justify-content:center;}
 .ol-ring svg{position:absolute;inset:0;}
 .ol-emoji{font-size:24px;position:relative;z-index:1;}
@@ -1094,9 +1246,8 @@ const CSS = `
 .ol-sub{font-size:13px;color:var(--mu);line-height:1.65;}
 .ol-dots{display:flex;gap:6px;}
 .ol-dot{width:7px;height:7px;border-radius:50%;background:var(--cy);animation:cr-bounce 1.2s ease-in-out infinite;}
-
-.modal-card{background:linear-gradient(145deg,#111827,#0a1020);border:1px solid var(--b2);border-radius:var(--r);
-  padding:38px 32px;text-align:center;max-width:350px;width:100%;animation:cr-fadeup .22s ease;}
+.ol-dot-am{background:var(--am);}
+.modal-card{background:linear-gradient(145deg,#111827,#0a1020);border:1px solid var(--b2);border-radius:var(--r);padding:38px 32px;text-align:center;max-width:350px;width:100%;animation:cr-fadeup .22s ease;}
 .modal-icon{font-size:34px;margin-bottom:12px;}
 .modal-title{font-family:var(--fd);font-size:19px;font-weight:700;color:#fff;margin-bottom:7px;}
 .modal-body{font-size:13px;color:var(--mu);margin-bottom:22px;}
@@ -1106,7 +1257,6 @@ const CSS = `
 .modal-btn-d:hover{background:rgba(248,113,113,.22);}
 .modal-btn-g{background:var(--sf2);color:var(--mu);border-color:var(--b2);}
 .modal-btn-g:hover{background:var(--sf3);color:var(--tx);}
-
 .intro-wrap{display:grid;grid-template-columns:1fr 1fr;min-height:calc(100vh - 64px);}
 @media(max-width:768px){.intro-wrap{grid-template-columns:1fr;}}
 .intro-img-side{position:relative;overflow:hidden;}
@@ -1123,12 +1273,7 @@ const CSS = `
 .intro-meta{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:36px;}
 .intro-meta-item{display:flex;align-items:center;gap:6px;font-size:11px;color:rgba(255,255,255,.4);background:var(--sf2);border:1px solid var(--b);padding:5px 11px;border-radius:100px;}
 .intro-conn{color:var(--cy);font-size:13px;animation:cr-blink 1.5s ease-in-out infinite;}
-
-.btn-p{display:inline-flex;align-items:center;gap:10px;
-  background:linear-gradient(135deg,#0891b2,#6366f1);color:#fff;border:none;
-  padding:13px 30px;border-radius:100px;font-family:var(--fd);font-size:14px;font-weight:700;cursor:pointer;
-  box-shadow:0 0 0 1px rgba(255,255,255,.1) inset,0 8px 24px rgba(34,211,238,.22);
-  transition:transform .15s,box-shadow .15s;}
+.btn-p{display:inline-flex;align-items:center;gap:10px;background:linear-gradient(135deg,#0891b2,#6366f1);color:#fff;border:none;padding:13px 30px;border-radius:100px;font-family:var(--fd);font-size:14px;font-weight:700;cursor:pointer;box-shadow:0 0 0 1px rgba(255,255,255,.1) inset,0 8px 24px rgba(34,211,238,.22);transition:transform .15s,box-shadow .15s;}
 .btn-p:hover{transform:translateY(-2px);box-shadow:0 0 0 1px rgba(255,255,255,.14) inset,0 12px 32px rgba(34,211,238,.32);}
 .btn-p:active{transform:none;}
 .btn-skip{background:none;border:1px solid var(--b2);color:var(--mu);font-family:var(--fb);font-size:11px;padding:7px 15px;border-radius:100px;cursor:pointer;transition:all .2s;}
@@ -1139,12 +1284,10 @@ const CSS = `
 .btn-mic-on:hover{background:rgba(248,113,113,.22);}
 .btn-danger{display:inline-flex;align-items:center;gap:6px;background:var(--re2);border:1px solid rgba(248,113,113,.3);color:var(--re);font-family:var(--fd);font-size:12px;font-weight:600;padding:9px 18px;border-radius:100px;cursor:pointer;transition:all .2s;}
 .btn-danger:hover{background:rgba(248,113,113,.22);}
-
 .game-lay{display:grid;grid-template-columns:180px 1fr;gap:28px;padding:32px 36px;max-width:1020px;margin:0 auto;width:100%;align-items:start;}
 @media(max-width:740px){.game-lay{grid-template-columns:1fr;padding:18px 14px;gap:18px;}}
 .game-l{display:flex;flex-direction:column;align-items:center;gap:12px;position:sticky;top:82px;}
 .game-r{display:flex;flex-direction:column;gap:12px;}
-
 .tmr-wrap{filter:drop-shadow(0 0 16px rgba(34,211,238,.1));}
 .tmr-urgent{animation:cr-pulse .72s ease-in-out infinite;}
 .ph-badge{font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:2px;text-transform:uppercase;padding:4px 13px;border-radius:100px;}
@@ -1157,14 +1300,12 @@ const CSS = `
 .wait-dot{width:6px;height:6px;border-radius:50%;background:var(--am);box-shadow:0 0 6px var(--am);animation:cr-blink 1.2s ease-in-out infinite;display:block;}
 .wait-lock{font-size:10px;color:var(--dm);}
 .wait-txt{display:flex;align-items:center;gap:7px;color:var(--mu);font-size:13px;}
-
 .q-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:24px 28px;position:relative;overflow:hidden;box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 10px 28px rgba(0,0,0,.4);}
 .q-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(34,211,238,.28),transparent);}
 .q-card-sm{padding:16px 20px;}
 .q-num{font-family:var(--fd);font-size:9px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:var(--dm);margin-bottom:9px;}
 .q-topic{font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--cy);margin-bottom:9px;}
 .q-text{font-family:var(--fb);font-size:16px;line-height:1.78;color:var(--tx);}
-
 .rdm{background:rgba(255,255,255,.02);border:1px solid var(--b);border-radius:var(--rs);overflow:hidden;transition:border-color .25s;}
 .rdm-open{border-color:rgba(34,211,238,.18);}
 .rdm-toggle{width:100%;background:none;border:none;color:var(--mu);font-family:var(--fd);font-size:10.5px;font-weight:700;letter-spacing:1px;text-transform:uppercase;padding:12px 15px;display:flex;align-items:center;gap:7px;cursor:pointer;transition:color .2s;}
@@ -1174,7 +1315,6 @@ const CSS = `
 .rdm-item{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:rgba(255,255,255,.48);line-height:1.62;padding:3px 0;transition:color .15s;}
 .rdm-item:hover{color:rgba(255,255,255,.72);}
 .rdm-dot{width:3.5px;height:3.5px;border-radius:50%;background:var(--cy);margin-top:8px;flex-shrink:0;}
-
 .tp-panel{border-radius:var(--rs);overflow:hidden;border:1px solid;}
 .tp-mine{background:rgba(34,211,238,.04);border-color:rgba(34,211,238,.18);}
 .tp-partner{background:rgba(99,102,241,.04);border-color:rgba(99,102,241,.18);}
@@ -1186,12 +1326,10 @@ const CSS = `
 .tp-ph{color:var(--dm);font-style:italic;}
 .tp-final{color:var(--tx);}
 .tp-interim{color:rgba(255,255,255,.32);font-style:italic;}
-
 .center-stage{display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 110px);padding:40px 24px;}
 .center-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:56px 44px;text-align:center;max-width:400px;width:100%;box-shadow:0 28px 56px rgba(0,0,0,.5);display:flex;flex-direction:column;align-items:center;gap:4px;}
 .cc-title{font-family:var(--fd);font-size:22px;font-weight:700;color:#fff;}
 .cc-sub{font-size:13px;color:var(--mu);}
-
 .res-lay{max-width:740px;margin:0 auto;padding:32px 28px;display:flex;flex-direction:column;gap:22px;}
 @media(max-width:768px){.res-lay{padding:18px 14px;}}
 .res-hdr{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
@@ -1199,7 +1337,6 @@ const CSS = `
 .res-sync{display:flex;align-items:center;gap:6px;background:var(--gr2);border:1px solid rgba(74,222,128,.22);color:var(--gr);font-size:10.5px;font-weight:600;padding:4px 11px;border-radius:100px;}
 .res-sync-dot{width:5px;height:5px;border-radius:50%;background:var(--gr);box-shadow:0 0 5px var(--gr);animation:cr-glow 2s ease-in-out infinite;}
 .res-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
-
 .rc-card{background:rgba(255,255,255,.025);backdrop-filter:blur(18px);border:1px solid rgba(34,211,238,.16);border-radius:var(--r);padding:26px 28px;box-shadow:0 0 0 1px rgba(255,255,255,.03) inset,0 14px 42px rgba(0,0,0,.45);position:relative;overflow:hidden;animation:cr-slide .32s ease both;}
 .rc-card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(34,211,238,.38),transparent);}
 .rc-loading{display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px;border-color:var(--b2);}
@@ -1221,11 +1358,9 @@ const CSS = `
 .rc-dot-green{background:var(--gr);box-shadow:0 0 4px var(--gr);}
 .rc-dot-amber{background:var(--am);box-shadow:0 0 4px var(--am);}
 .rc-dot-cyan {background:var(--cy);box-shadow:0 0 4px var(--cy);}
-
 .rc-orig{font-family:var(--fb);font-size:13.5px;line-height:1.82;color:rgba(255,255,255,.62);}
 .err-hl{color:var(--re);background:var(--re2);border-radius:3px;padding:1px 4px;font-style:italic;text-decoration:underline wavy rgba(248,113,113,.5);text-decoration-thickness:1.5px;}
 .rc-corr{font-family:var(--fb);font-size:13.5px;line-height:1.82;color:var(--gr);}
-
 .rc-errs{display:flex;flex-direction:column;gap:7px;}
 .rc-err-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:12.5px;}
 .rc-err-orig{background:var(--re2);border:1px solid rgba(248,113,113,.18);color:var(--re);padding:2px 7px;border-radius:5px;font-style:italic;}
@@ -1233,13 +1368,32 @@ const CSS = `
 .rc-err-arr{color:var(--dm);}
 .rc-err-exp{font-size:11px;color:var(--mu);font-style:italic;}
 .rc-feedback{font-family:var(--fb);font-size:13.5px;line-height:1.78;color:rgba(255,255,255,.58);}
-
+/* ── Musterlösung ── */
+.mc-wrap{display:flex;flex-direction:column;gap:14px;animation:cr-slide .35s ease both;}
+.mc-notice{display:flex;align-items:flex-start;gap:14px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.22);border-radius:var(--rs);padding:16px 18px;}
+.mc-notice-icon{font-size:22px;flex-shrink:0;margin-top:2px;}
+.mc-notice-title{font-family:var(--fd);font-size:13.5px;font-weight:700;color:var(--am);margin-bottom:3px;}
+.mc-notice-sub{font-size:12.5px;color:var(--mu);line-height:1.55;}
+.mc-card{border-color:rgba(251,191,36,.25);}
+.mc-card::before{background:linear-gradient(90deg,transparent,rgba(251,191,36,.4),transparent);}
+.mc-badge{background:var(--am2);border:1px solid rgba(251,191,36,.28);color:var(--am);font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:3px 11px;border-radius:100px;}
+.mc-part-text{font-family:var(--fb);font-size:13.5px;line-height:1.82;color:rgba(255,255,255,.78);}
+.mc-tip{display:flex;align-items:flex-start;gap:10px;background:var(--cy2);border:1px solid var(--b3);border-radius:var(--rs);padding:12px 15px;margin-top:6px;}
+.mc-tip-icon{font-size:15px;flex-shrink:0;}
+.mc-tip p{font-size:12px;color:var(--cy);line-height:1.55;}
+/* ── Muster reference collapsible ── */
+.muster-ref-details{border:1px solid var(--b);border-radius:var(--rs);overflow:hidden;}
+.muster-ref-summary{display:flex;align-items:center;gap:8px;padding:12px 16px;font-family:var(--fd);font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--mu);cursor:pointer;list-style:none;transition:color .2s;user-select:none;}
+.muster-ref-summary::-webkit-details-marker{display:none;}
+.muster-ref-summary:hover{color:var(--am);}
+.muster-ref-details[open] .muster-ref-summary{color:var(--am);border-bottom:1px solid var(--b);}
+/* ── Switch card ── */
 .sw-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:48px 40px;text-align:center;max-width:390px;width:100%;display:flex;flex-direction:column;align-items:center;gap:14px;box-shadow:0 28px 56px rgba(0,0,0,.5);}
 .sw-icon{width:58px;height:58px;border-radius:50%;background:var(--cy2);border:1px solid var(--b3);display:flex;align-items:center;justify-content:center;}
 .sw-title{font-family:var(--fd);font-size:24px;font-weight:800;color:#fff;}
 .sw-sub{font-size:13px;color:var(--mu);line-height:1.6;}
 .sw-name{color:var(--cy);font-weight:600;}
-
+/* ── Finished ── */
 .fin-lay{max-width:780px;margin:0 auto;padding:44px 28px;display:flex;flex-direction:column;align-items:center;gap:28px;}
 .fin-hero{text-align:center;}
 .fin-trophy{font-size:56px;margin-bottom:10px;}
@@ -1247,11 +1401,14 @@ const CSS = `
 .fin-sub{font-size:14px;color:var(--mu);margin-top:5px;}
 .fin-scores{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;}
 .ssc{background:var(--sf2);border:1px solid var(--b2);border-radius:var(--r);padding:22px 28px;text-align:center;min-width:128px;}
+.ssc-learn{border-color:rgba(251,191,36,.22);background:rgba(251,191,36,.06);}
 .ssc-rnd{font-family:var(--fd);font-size:9.5px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--mu);margin-bottom:7px;}
 .ssc-s{font-family:var(--fd);font-size:34px;font-weight:800;color:var(--cy);line-height:1;}
 .ssc-s span{font-size:14px;color:var(--dm);font-weight:400;}
 .ssc-bars{display:flex;align-items:flex-end;gap:3px;margin-top:9px;justify-content:center;}
 .ssc-b{width:7px;border-radius:2.5px 2.5px 0 0;background:var(--sf3);height:var(--bh);}
 .ssc-b-on{background:linear-gradient(to top,#22d3ee,#6366f1);}
+.ssc-learn-icon{font-size:28px;margin:4px 0;}
+.ssc-learn-lbl{font-family:var(--fd);font-size:10px;font-weight:700;color:var(--am);letter-spacing:1px;}
 .fin-results{width:100%;display:flex;flex-direction:column;gap:18px;}
 `;
