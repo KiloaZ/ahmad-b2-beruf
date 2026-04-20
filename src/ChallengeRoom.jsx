@@ -1,28 +1,22 @@
 /**
- * ChallengeRoom.jsx — B2 Beruf · v10 Surgical Fixes
+ * ChallengeRoom.jsx — B2 Beruf · v11 Final
  *
- * FIXES in v10:
- *  1. DYNAMIC ROUND-ROBIN: handleNextRound now derives the next speaker from
- *     the live `players` object (Host/Guest), ensuring correct UID rotation
- *     every round regardless of join order. No static array assumptions.
+ * CHANGES in v11:
+ *  1. TRUE TURN-TAKING: handleNextRound performs a single atomic Firebase write
+ *     that swaps currentSpeaker, increments round, picks a new question, and
+ *     sets status → "prep" directly. No intermediate "switching" screen.
+ *     The new speaker's countdown auto-fires via the existing roomState listener.
  *
- *  2. HARD STATE RESET: All Firebase listeners are torn down and rebuilt on
- *     roomId change via the useEffect cleanup return. `transcripts` and
- *     `roundResults` are explicitly cleared before each new round begins,
- *     preventing stale data from bleeding across sessions.
+ *  2. SPEAKER-ONLY BUTTONS: "Nächste Runde" and "Abschlussergebnis" are gated
+ *     on `amSpeaker` only — isSolo exception removed. Listener sees "Warte…".
  *
- *  3. SYNC FEEDBACK: `aiResult` is written to `rooms/{roomId}/results/${roundKey}`
- *     atomically before status is set to "results". The Firebase `results`
- *     listener maps every key directly into `roundResults` state. The Round-
- *     Progress indicator re-renders reactively whenever `roundResults` changes,
- *     so both users see the updated dots simultaneously.
+ *  3. SWITCHING SCREEN REMOVED: The "Rollenwechsel" interstitial is gone.
+ *     Turn transition is seamless and instant for both clients.
  *
- *  4. B2 BERUF FALLBACK: If `transcriptRef.current` is empty at speak-end,
- *     the AI evaluator is NOT called. Instead a model-answer object with
- *     `isModelAnswer: true` is written to Firebase and shown via MusterCard.
- *     This preserves API credits and provides structured learning value.
+ *  4. handleSkipPrep + handleSpeakEnd restored in full.
  *
- *  All fast-path optimisations and UI from v9 are preserved.
+ *  All v10 fixes (dynamic round-robin, hard state reset, sync feedback,
+ *  B2 Beruf fallback) are preserved.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -616,16 +610,12 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ResultsView — unified dispatcher
-//   isModelAnswer=true   → MusterCard (no score, B2 fallback)
-//   isLearningMode=true  → MusterCard (learning, no transcript)
-//   otherwise            → ResultCard + optional collapsible MusterCard
 // ─────────────────────────────────────────────────────────────────────────────
 function ResultsView({ result, roundNum, speakerName, isLoading }) {
   if (isLoading)
     return <ResultCard result={null} speakerName={speakerName} roundNum={roundNum} isLoading />;
   if (!result) return null;
 
-  // FIX 4: model-answer branch (empty transcript fallback)
   if (result.isModelAnswer && result.muster) {
     return (
       <MusterCard
@@ -820,8 +810,8 @@ export default function ChallengeRoom({
   onExit,
   heroBgImage  = "/hero-bg.jpg",
 }) {
-  const me     = currentUser || { uid: "demo", displayName: "Du" };
-  const isSolo = mode === "solo";
+  const me      = currentUser || { uid: "demo", displayName: "Du" };
+  const isSolo  = mode === "solo";
   const isMulti = mode === "multi";
 
   const [rs, setRs] = useState({
@@ -833,36 +823,29 @@ export default function ChallengeRoom({
     round: 1,
     speakerOrder: [me.uid],
   });
-  const [transcripts,    setTranscripts]    = useState({});
-  const [roundResults,   setRoundResults]   = useState({});
-  const [analyzingMap,   setAnalyzingMap]   = useState({});
-  const [isLearningMode, setIsLearningMode] = useState(false);
-
-  // FIX 1: store the full `players` object from Firebase to derive rotation
-  const [players,        setPlayers]        = useState({});
-  const [partnerUid,     setPartnerUid]     = useState(null);
-  const [partnerName,    setPartnerName]    = useState("Partner");
-  const [fbReady,        setFbReady]        = useState(!isMulti);
-  const [isRecording,    setIsRecording]    = useState(false);
-  const [showExitConfirm,setShowExitConfirm]= useState(false);
-  const [phaseAnim,      setPhaseAnim]      = useState("in");
-  const [soloUsedIds,    setSoloUsedIds]    = useState([]);
+  const [transcripts,     setTranscripts]     = useState({});
+  const [roundResults,    setRoundResults]     = useState({});
+  const [analyzingMap,    setAnalyzingMap]     = useState({});
+  const [isLearningMode,  setIsLearningMode]   = useState(false);
+  const [players,         setPlayers]          = useState({});
+  const [partnerUid,      setPartnerUid]       = useState(null);
+  const [partnerName,     setPartnerName]      = useState("Partner");
+  const [fbReady,         setFbReady]          = useState(!isMulti);
+  const [isRecording,     setIsRecording]      = useState(false);
+  const [showExitConfirm, setShowExitConfirm]  = useState(false);
+  const [phaseAnim,       setPhaseAnim]        = useState("in");
+  const [soloUsedIds,     setSoloUsedIds]      = useState([]);
 
   const transcriptRef   = useRef("");
   const rsRef           = useRef(rs);
   const partnerUidRef   = useRef(null);
-  const playersRef      = useRef({});          // FIX 1: live players ref
+  const playersRef      = useRef({});
   const masterTimerRef  = useRef(null);
   const masterEndsAtRef = useRef(null);
   const currentQRef     = useRef(null);
 
-  // Keep rsRef always in sync with the latest committed rs state.
-  // handleNextRound reads rsRef.current so it always gets the absolute
-  // latest currentSpeaker even if React hasn't re-rendered yet.
   useEffect(() => { rsRef.current = rs; }, [rs]);
   useEffect(() => { partnerUidRef.current = partnerUid; }, [partnerUid]);
-  // playersRef mirrors the players state so async handlers that close over
-  // the ref (not the state) always see the current A/B slot data.
   useEffect(() => { playersRef.current = players; }, [players]);
   useEffect(() => () => clearInterval(masterTimerRef.current), []);
 
@@ -883,11 +866,10 @@ export default function ChallengeRoom({
   const isSpeakerAnalyzing = !!analyzingMap[rs.currentSpeaker];
   const timeLeft           = useTimerDisplay(rs.timerEndsAt, totalSec);
 
-  // ── FIX 2: Firebase listeners with full cleanup on roomId change ──────────
+  // ── Firebase listeners ────────────────────────────────────────────────────
   useEffect(() => {
     if (!isMulti || !roomId) return;
 
-    // Hard reset local state before attaching new listeners
     setTranscripts({});
     setRoundResults({});
     setAnalyzingMap({});
@@ -898,7 +880,6 @@ export default function ChallengeRoom({
     let mounted = true;
 
     (async () => {
-      // Players listener — used for round-robin rotation (FIX 1)
       cleanupFns.push(
         await fbListen(`rooms/${roomId}/players`, (playersData) => {
           if (!mounted || !playersData) return;
@@ -910,7 +891,6 @@ export default function ChallengeRoom({
         })
       );
 
-      // Room state listener
       cleanupFns.push(
         await fbListen(`rooms/${roomId}/roomState`, (data) => {
           if (!mounted) return;
@@ -931,7 +911,6 @@ export default function ChallengeRoom({
         })
       );
 
-      // Transcript listener
       cleanupFns.push(
         await fbListen(`rooms/${roomId}/transcript`, (data) => {
           if (!mounted || !data) return;
@@ -942,17 +921,13 @@ export default function ChallengeRoom({
         })
       );
 
-      // FIX 3: Results listener — maps every key directly into roundResults state
-      // Both users react reactively; the Round-Progress dots re-render via state.
       cleanupFns.push(
         await fbListen(`rooms/${roomId}/results`, (data) => {
           if (!mounted) return;
-          // Overwrite entire roundResults so stale keys don't persist
           setRoundResults(data || {});
         })
       );
 
-      // Analyzing listener
       cleanupFns.push(
         await fbListen(`rooms/${roomId}/analyzing`, (data) => {
           if (!mounted) return;
@@ -961,7 +936,6 @@ export default function ChallengeRoom({
       );
     })();
 
-    // FIX 2: cleanup tears down ALL listeners when roomId changes or unmounts
     return () => {
       mounted = false;
       cleanupFns.forEach((fn) => fn?.());
@@ -1033,6 +1007,7 @@ export default function ChallengeRoom({
     (text) => { writeTx("interim", text); },
     [writeTx]
   );
+
   const micActive = status === "speaking" && amSpeaker && isRecording;
 
   const { start: startRecog, stop: stopRecog } = useSpeechRecognition({
@@ -1040,6 +1015,7 @@ export default function ChallengeRoom({
     onInterim: handleInterim,
     active: micActive,
   });
+
   useEffect(() => {
     if (micActive) startRecog();
     else stopRecog();
@@ -1053,13 +1029,13 @@ export default function ChallengeRoom({
       setPhaseAnim("in");
     }, 200);
   }
+
   function handleExitRequest() {
     if (anyAnalyzing || isLearningMode) return;
     if (status === "intro" || status === "finished") { onExit?.(); return; }
     setShowExitConfirm(true);
   }
 
-  // FIX 2: hard-reset local transcript + round state before each new round
   async function _hardResetRound() {
     transcriptRef.current = "";
     setIsLearningMode(false);
@@ -1117,7 +1093,106 @@ export default function ChallengeRoom({
     anim();
   }
 
-async function handleNextRound() {
+  async function handleSkipPrep() {
+    if (!amSpeaker) return;
+    clearInterval(masterTimerRef.current);
+    masterEndsAtRef.current = null;
+    await _doBeginSpeaking();
+  }
+
+  // ── handleSpeakEnd ────────────────────────────────────────────────────────
+  async function handleSpeakEnd() {
+    if (isMulti && rsRef.current.currentSpeaker !== me.uid) return;
+    clearInterval(masterTimerRef.current);
+    masterEndsAtRef.current = null;
+    setIsRecording(false);
+    stopRecog();
+    playBeep({ freq: 440, gain: 0.3 });
+
+    const finalText      = transcriptRef.current;
+    const curRound       = rsRef.current.round;
+    const curRKey        = `round${curRound}`;
+    const q              = currentQRef.current;
+    const questionText   = q?.question || "";
+    const topicText      = q?.topic    || "";
+    const spokeSomething = hasContent(finalText);
+
+    const flagPath = isMulti && roomId ? `rooms/${roomId}/analyzing/${me.uid}` : null;
+
+    await Promise.all([
+      flagPath
+        ? fbSet(flagPath, true)
+        : Promise.resolve(setAnalyzingMap((p) => ({ ...p, [me.uid]: true }))),
+      pushRS({ status: "analyzing", timerEndsAt: null }),
+    ]);
+    anim();
+
+    try {
+      if (spokeSomething) {
+        // ── Normal path: evaluate + fetch Musterlösung in parallel ───────────
+        setIsLearningMode(false);
+        const [aiResult, muster] = await Promise.all([
+          fetchAI(finalText, questionText),
+          fetchModelAnswer(questionText, topicText),
+        ]);
+        const payload = {
+          ...(aiResult || {
+            score: 2, isOffTopic: false, correctedText: "",
+            feedback: "Keine Auswertung verfügbar.", errors: [],
+          }),
+          transcript:     finalText,
+          speakerUid:     me.uid,
+          isModelAnswer:  false,
+          isLearningMode: false,
+          muster,
+          savedAt:        Date.now(),
+        };
+        if (isMulti && roomId) {
+          await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
+        } else {
+          setRoundResults((p) => ({ ...p, [curRKey]: payload }));
+        }
+        await pushRS({ status: "results" });
+        anim();
+      } else {
+        // ── Silent path: skip AI, generate Musterlösung only ─────────────────
+        setIsLearningMode(true);
+        const muster = await fetchModelAnswer(questionText, topicText);
+        const payload = {
+          score:          0,
+          isOffTopic:     false,
+          isModelAnswer:  true,
+          isLearningMode: true,
+          transcript:     "",
+          speakerUid:     me.uid,
+          muster,
+          correctedText:  "",
+          feedback:       "Du hast keine Antwort gegeben. Hier ist die ideale Antwort — übe damit!",
+          errors:         [],
+          savedAt:        Date.now(),
+        };
+        if (isMulti && roomId) {
+          await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
+        } else {
+          setRoundResults((p) => ({ ...p, [curRKey]: payload }));
+        }
+        setIsLearningMode(false);
+        await pushRS({ status: "results" });
+        anim();
+      }
+    } catch (err) {
+      console.error("Round-end error:", err);
+      setIsLearningMode(false);
+      await pushRS({ status: "results" });
+      anim();
+    } finally {
+      if (flagPath) await fbSet(flagPath, false);
+      else setAnalyzingMap((p) => ({ ...p, [me.uid]: false }));
+    }
+  }
+
+  // ── handleNextRound — atomic A/B swap → prep ──────────────────────────────
+  async function handleNextRound() {
     if (!amSpeaker) return;
 
     const currentSpeaker = rsRef.current.currentSpeaker;
@@ -1125,7 +1200,7 @@ async function handleNextRound() {
     let nextSpeaker;
 
     if (isMulti && roomId) {
-      // ── Resolve authoritative players object ──────────────────────────────
+      // Resolve authoritative players object
       let pl = playersRef.current || {};
       if (!pl.A?.uid || !pl.B?.uid) {
         try {
@@ -1149,7 +1224,7 @@ async function handleNextRound() {
         ? (currentSpeaker === uidA ? uidB : uidA)
         : (partnerUidRef.current || me.uid);
 
-      // ── Reset transcripts for both players ───────────────────────────────
+      // Reset transcripts for both players
       await Promise.all([
         fbSet(`rooms/${roomId}/transcript/${me.uid}`,
           { text: "", interim: "", updatedAt: Date.now() }),
@@ -1159,13 +1234,14 @@ async function handleNextRound() {
           : Promise.resolve(),
       ]);
 
-      // ── Pick the next question ────────────────────────────────────────────
+      // Pick next question
       const q = pickRandom(propQ, []);
       if (!q) { console.warn("No questions"); return; }
 
       const endsAt = Date.now() + PREP_SEC * 1000;
 
-      // ── Single atomic write: swap speaker + start prep immediately ────────
+      // Single atomic write: swap speaker + start prep immediately
+      // The new speaker's roomState listener fires _startCountdown automatically.
       await fbUpdate(`rooms/${roomId}/roomState`, {
         currentSpeaker:    nextSpeaker,
         round:             nextRound,
@@ -1202,10 +1278,7 @@ async function handleNextRound() {
 
     anim();
   }
-  async function handleStartMyRound() {
-    if (!amSpeaker) return;
-    await beginPrep(me.uid, rsRef.current.round);
-  }
+
   async function handleFinish() {
     await pushRS({ status: "finished" });
     anim();
@@ -1251,8 +1324,6 @@ async function handleNextRound() {
           </div>
           <div className="cr-hdr-c">
             {status !== "intro" && (
-              // FIX 3: Round-Progress dots are derived directly from roundResults state.
-              // They update reactively for BOTH users whenever Firebase pushes new results.
               <div className="cr-prog">
                 {[1, 2].map((r) => (
                   <div
@@ -1479,19 +1550,21 @@ async function handleNextRound() {
                 isLoading={!currentRoundResult && isSpeakerAnalyzing}
               />
               <div className="res-actions">
+                {/* Round 1 → only current speaker advances */}
                 {rs.round === 1 &&
-  (amSpeaker ? (
-    <button className="btn-p" onClick={handleNextRound}>
-      Nächste Runde →
-    </button>
-  ) : (
-    <p className="wait-txt">
-      <span className="wait-dot" />
-      Warte auf {speakerDisplayName}…
-    </p>
-  ))}
+                  (amSpeaker ? (
+                    <button className="btn-p" onClick={handleNextRound}>
+                      Nächste Runde →
+                    </button>
+                  ) : (
+                    <p className="wait-txt">
+                      <span className="wait-dot" />
+                      Warte auf {speakerDisplayName}…
+                    </p>
+                  ))}
+                {/* Round 2 → only current speaker finishes */}
                 {rs.round >= 2 &&
-                  (amSpeaker || isSolo ? (
+                  (amSpeaker ? (
                     <button className="btn-p" onClick={handleFinish}>
                       Abschlussergebnis →
                     </button>
@@ -1504,9 +1577,6 @@ async function handleNextRound() {
               </div>
             </div>
           )}
-
-          {/* SWITCHING */}
-      
 
           {/* FINISHED */}
           {status === "finished" && (
@@ -1592,7 +1662,7 @@ async function handleNextRound() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CSS (unchanged from v9)
+// CSS
 // ─────────────────────────────────────────────────────────────────────────────
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap');
@@ -1797,11 +1867,6 @@ const CSS = `
 .muster-ref-summary::-webkit-details-marker{display:none;}
 .muster-ref-summary:hover{color:var(--am);}
 .muster-ref-details[open] .muster-ref-summary{color:var(--am);border-bottom:1px solid var(--b);}
-.sw-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:48px 40px;text-align:center;max-width:390px;width:100%;display:flex;flex-direction:column;align-items:center;gap:14px;box-shadow:0 28px 56px rgba(0,0,0,.5);}
-.sw-icon{width:58px;height:58px;border-radius:50%;background:var(--cy2);border:1px solid var(--b3);display:flex;align-items:center;justify-content:center;}
-.sw-title{font-family:var(--fd);font-size:24px;font-weight:800;color:#fff;}
-.sw-sub{font-size:13px;color:var(--mu);line-height:1.6;}
-.sw-name{color:var(--cy);font-weight:600;}
 .fin-lay{max-width:780px;margin:0 auto;padding:44px 28px;display:flex;flex-direction:column;align-items:center;gap:28px;}
 .fin-hero{text-align:center;}
 .fin-trophy{font-size:56px;margin-bottom:10px;}
