@@ -1,16 +1,28 @@
 /**
- * ChallengeRoom.jsx — B2 Beruf · v9 Learning-Mode
+ * ChallengeRoom.jsx — B2 Beruf · v10 Surgical Fixes
  *
- * NEW in v9:
- *  ─ Empty-transcript detection at round end (solo + multi)
- *  ─ Learning Mode: if speaker said nothing → fetch Musterlösung via AI
- *  ─ Musterlösung follows Telc B2 Beruf Teil 2 structure:
- *      Einleitung · Vorschlag · Begründung · Schluss
- *  ─ ResultCard shows special "Lernmodus" UI when isLearningMode=true
- *  ─ In multi: if speaker is silent → model answer shown to BOTH users
- *  ─ In multi: if speaker spoke → normal analysis + model answer as collapsible reference
- *  ─ fetchModelAnswer() uses separate AI call (max_tokens 600, temp 0.3)
- *  ─ All fast-path optimisations from v8 preserved
+ * FIXES in v10:
+ *  1. DYNAMIC ROUND-ROBIN: handleNextRound now derives the next speaker from
+ *     the live `players` object (Host/Guest), ensuring correct UID rotation
+ *     every round regardless of join order. No static array assumptions.
+ *
+ *  2. HARD STATE RESET: All Firebase listeners are torn down and rebuilt on
+ *     roomId change via the useEffect cleanup return. `transcripts` and
+ *     `roundResults` are explicitly cleared before each new round begins,
+ *     preventing stale data from bleeding across sessions.
+ *
+ *  3. SYNC FEEDBACK: `aiResult` is written to `rooms/{roomId}/results/${roundKey}`
+ *     atomically before status is set to "results". The Firebase `results`
+ *     listener maps every key directly into `roundResults` state. The Round-
+ *     Progress indicator re-renders reactively whenever `roundResults` changes,
+ *     so both users see the updated dots simultaneously.
+ *
+ *  4. B2 BERUF FALLBACK: If `transcriptRef.current` is empty at speak-end,
+ *     the AI evaluator is NOT called. Instead a model-answer object with
+ *     `isModelAnswer: true` is written to Firebase and shown via MusterCard.
+ *     This preserves API credits and provides structured learning value.
+ *
+ *  All fast-path optimisations and UI from v9 are preserved.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -21,24 +33,33 @@ import { useState, useEffect, useRef, useCallback } from "react";
 let _db = null;
 async function getDB() {
   if (_db) return _db;
-  try { const m = await import("./firebase-config.js"); _db = m.db; return _db; }
-  catch { console.warn("Firebase not configured — solo/offline only."); return null; }
+  try {
+    const m = await import("./firebase-config.js");
+    _db = m.db;
+    return _db;
+  } catch {
+    console.warn("Firebase not configured — solo/offline only.");
+    return null;
+  }
 }
 async function fbSet(path, value) {
-  const db = await getDB(); if (!db) return;
+  const db = await getDB();
+  if (!db) return;
   const { ref, set } = await import("firebase/database");
   await set(ref(db, path), value);
 }
 async function fbUpdate(path, partial) {
-  const db = await getDB(); if (!db) return;
+  const db = await getDB();
+  if (!db) return;
   const { ref, update } = await import("firebase/database");
   await update(ref(db, path), partial);
 }
 async function fbListen(path, cb) {
-  const db = await getDB(); if (!db) return () => {};
+  const db = await getDB();
+  if (!db) return () => {};
   const { ref, onValue, off } = await import("firebase/database");
   const r = ref(db, path);
-  onValue(r, snap => cb(snap.exists() ? snap.val() : null));
+  onValue(r, (snap) => cb(snap.exists() ? snap.val() : null));
   return () => off(r);
 }
 
@@ -48,13 +69,19 @@ async function fbListen(path, cb) {
 function playBeep({ freq = 880, duration = 0.18, type = "sine", gain = 0.35 } = {}) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator(), env = ctx.createGain();
-    osc.connect(env); env.connect(ctx.destination);
-    osc.type = type; osc.frequency.value = freq;
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+    osc.connect(env);
+    env.connect(ctx.destination);
+    osc.type = type;
+    osc.frequency.value = freq;
     env.gain.setValueAtTime(gain, ctx.currentTime);
     env.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-    osc.start(); osc.stop(ctx.currentTime + duration);
-  } catch { /* ignore */ }
+    osc.start();
+    osc.stop(ctx.currentTime + duration);
+  } catch {
+    /* ignore */
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,7 +91,7 @@ const PREP_SEC  = 30;
 const SPEAK_SEC = 180;
 const OA_KEY    = import.meta.env.VITE_OPENAI_API_KEY;
 
-// ── Evaluator prompt (fast, v8) ───────────────────────────────────────────────
+// ── Evaluator prompt ──────────────────────────────────────────────────────────
 const AI_SYSTEM = `You are a German B2 oral exam evaluator. You receive a TASK and a RESPONSE.
 
 Evaluate on TWO criteria:
@@ -77,7 +104,7 @@ A grammatically perfect but off-topic answer MUST score 2.
 Return ONLY compact JSON, no markdown:
 {"score":<2-5>,"isOffTopic":<bool>,"correctedText":"<corrected>","feedback":"<2 sentences in German>","errors":[{"original":"<wrong>","correction":"<right>","explanation":"<German>"}]}`;
 
-// ── Musterlösung prompt — Telc B2 Beruf Teil 2 ───────────────────────────────
+// ── Musterlösung prompt ───────────────────────────────────────────────────────
 const MUSTER_SYSTEM = `You are an expert German B2 Beruf (Telc) oral exam coach.
 Generate a MODEL ANSWER (Musterlösung) for the given Telc B2 Beruf Teil 2 Mündlich task.
 
@@ -100,21 +127,27 @@ Return ONLY compact JSON, no markdown:
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 function pickRandom(questions = [], usedIds = []) {
-  const pool = questions.filter(q => !usedIds.includes(q.id));
+  const pool = questions.filter((q) => !usedIds.includes(q.id));
   const src  = pool.length ? pool : questions;
   if (!src.length) return null;
   return src[Math.floor(Math.random() * src.length)];
 }
 function escHtml(s = "") {
-  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 function buildHighlightedHTML(text = "", errors = []) {
   if (!text || !errors.length) return escHtml(text);
   let out = escHtml(text);
   errors.forEach(({ original }) => {
     if (!original) return;
-    const esc = escHtml(original).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
-    out = out.replace(new RegExp(`(${esc})`, "gi"), `<span class="err-hl">$1</span>`);
+    const esc = escHtml(original).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(
+      new RegExp(`(${esc})`, "gi"),
+      `<span class="err-hl">$1</span>`
+    );
   });
   return out;
 }
@@ -124,50 +157,66 @@ function lev(a, b, cap = 40) {
   for (let i = 1; i <= a.length; i++) {
     let prev = i;
     for (let j = 1; j <= b.length; j++) {
-      const v = a[i-1]===b[j-1] ? row[j-1] : 1+Math.min(row[j-1],row[j],prev);
-      row[j-1]=prev; prev=v;
+      const v =
+        a[i - 1] === b[j - 1]
+          ? row[j - 1]
+          : 1 + Math.min(row[j - 1], row[j], prev);
+      row[j - 1] = prev;
+      prev = v;
     }
-    row[b.length]=prev;
+    row[b.length] = prev;
   }
   return row[b.length];
 }
 function sanitize(existing, chunk) {
-  const t=chunk.trim(); if(!t) return "";
-  if(!existing) return t;
-  const nE=existing.toLowerCase().replace(/\s+/g," ").trim();
-  const nC=t.toLowerCase().replace(/\s+/g," ").trim();
-  if(nE.includes(nC)) return "";
-  const words=nE.split(" ");
-  for(let len=Math.min(12,words.length);len>=2;len--){
-    const suf=words.slice(-len).join(" ");
-    if(nC.startsWith(suf)){
-      const stripped=t.slice(suf.length).trimStart();
-      if(!stripped||nE.includes(stripped.toLowerCase())) return "";
+  const t = chunk.trim();
+  if (!t) return "";
+  if (!existing) return t;
+  const nE = existing.toLowerCase().replace(/\s+/g, " ").trim();
+  const nC = t.toLowerCase().replace(/\s+/g, " ").trim();
+  if (nE.includes(nC)) return "";
+  const words = nE.split(" ");
+  for (let len = Math.min(12, words.length); len >= 2; len--) {
+    const suf = words.slice(-len).join(" ");
+    if (nC.startsWith(suf)) {
+      const stripped = t.slice(suf.length).trimStart();
+      if (!stripped || nE.includes(stripped.toLowerCase())) return "";
       return stripped;
     }
   }
-  const win=nE.slice(-Math.min(nC.length*2,nE.length));
-  const d=lev(nC,win,Math.ceil(nC.length*0.5));
-  if(1-d/Math.max(nC.length,win.length,1)>0.85) return "";
+  const win = nE.slice(-Math.min(nC.length * 2, nE.length));
+  const d   = lev(nC, win, Math.ceil(nC.length * 0.5));
+  if (1 - d / Math.max(nC.length, win.length, 1) > 0.85) return "";
   return t;
 }
 
-/** True when the transcript has at least 3 real words — user actually spoke */
+/** True when the transcript has at least 3 real words */
 function hasContent(text = "") {
-  return text.trim().replace(/\s+/g," ").split(" ").filter(w => w.length > 1).length >= 3;
+  return (
+    text
+      .trim()
+      .replace(/\s+/g, " ")
+      .split(" ")
+      .filter((w) => w.length > 1).length >= 3
+  );
 }
 
 /** Fallback Musterlösung used when the AI call fails */
 const FALLBACK_MUSTER = {
-  einleitung  : "Ich möchte zunächst kurz auf die Situation eingehen, die uns heute beschäftigt.",
-  vorschlag   : "Mein Vorschlag wäre, dieses Thema in einer gemeinsamen Besprechung zu klären.",
-  begruendung : "Das hat den Vorteil, dass alle Beteiligten die gleichen Informationen erhalten. Außerdem können Missverständnisse direkt besprochen werden. Darüber hinaus stärkt eine offene Kommunikation das Vertrauen im Team.",
-  schluss     : "Abschließend möchte ich betonen, dass ich für weitere Vorschläge und Fragen offen bin.",
-  fullAnswer  : "Ich möchte zunächst kurz auf die Situation eingehen, die uns heute beschäftigt. Mein Vorschlag wäre, dieses Thema in einer gemeinsamen Besprechung zu klären. Das hat den Vorteil, dass alle Beteiligten die gleichen Informationen erhalten. Außerdem können Missverständnisse direkt besprochen werden. Darüber hinaus stärkt eine offene Kommunikation das Vertrauen im Team. Abschließend möchte ich betonen, dass ich für weitere Vorschläge und Fragen offen bin.",
+  einleitung:
+    "Ich möchte zunächst kurz auf die Situation eingehen, die uns heute beschäftigt.",
+  vorschlag:
+    "Mein Vorschlag wäre, dieses Thema in einer gemeinsamen Besprechung zu klären.",
+  begruendung:
+    "Das hat den Vorteil, dass alle Beteiligten die gleichen Informationen erhalten. Außerdem können Missverständnisse direkt besprochen werden. Darüber hinaus stärkt eine offene Kommunikation das Vertrauen im Team.",
+  schluss:
+    "Abschließend möchte ich betonen, dass ich für weitere Vorschläge und Fragen offen bin.",
+  fullAnswer:
+    "Ich möchte zunächst kurz auf die Situation eingehen, die uns heute beschäftigt. Mein Vorschlag wäre, dieses Thema in einer gemeinsamen Besprechung zu klären. Das hat den Vorteil, dass alle Beteiligten die gleichen Informationen erhalten. Außerdem können Missverständnisse direkt besprochen werden. Darüber hinaus stärkt eine offene Kommunikation das Vertrauen im Team. Abschließend möchte ich betonen, dass ich für weitere Vorschläge und Fragen offen bin.",
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OpenAI — Evaluator (fast path)
+// OpenAI — Evaluator
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchAI(transcript, question) {
   if (!OA_KEY || !transcript?.trim()) return null;
@@ -177,20 +226,30 @@ async function fetchAI(transcript, question) {
     : `RESPONSE: ${trimmedTranscript}`;
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OA_KEY}` },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OA_KEY}`,
+    },
     body: JSON.stringify({
-      model: "gpt-4o-mini", max_tokens: 400, temperature: 0,
+      model: "gpt-4o-mini",
+      max_tokens: 400,
+      temperature: 0,
       response_format: { type: "json_object" },
       messages: [
         { role: "system", content: AI_SYSTEM },
-        { role: "user",   content: userContent },
+        { role: "user", content: userContent },
       ],
     }),
   });
   if (!res.ok) throw new Error(`OpenAI ${res.status}`);
   const data = await res.json();
   const raw  = data.choices?.[0]?.message?.content || "";
-  try { return JSON.parse(raw); } catch { console.error("AI parse:", raw); return null; }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    console.error("AI parse:", raw);
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,22 +263,27 @@ async function fetchModelAnswer(question, topic = "") {
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${OA_KEY}` },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OA_KEY}`,
+      },
       body: JSON.stringify({
-        model: "gpt-4o-mini", max_tokens: 600, temperature: 0.3,
+        model: "gpt-4o-mini",
+        max_tokens: 600,
+        temperature: 0.3,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: MUSTER_SYSTEM },
-          { role: "user",   content: userContent },
+          { role: "user", content: userContent },
         ],
       }),
     });
     if (!res.ok) throw new Error(`OpenAI Muster ${res.status}`);
-    const data = await res.json();
-    const raw  = data.choices?.[0]?.message?.content || "";
+    const data   = await res.json();
+    const raw    = data.choices?.[0]?.message?.content || "";
     const parsed = JSON.parse(raw);
     return parsed;
-  } catch(e) {
+  } catch (e) {
     console.error("Muster fetch failed, using fallback:", e);
     return FALLBACK_MUSTER;
   }
@@ -232,32 +296,62 @@ function useSpeechRecognition({ onFinal, onInterim, active }) {
   const recogRef    = useRef(null);
   const activeRef   = useRef(active);
   const debounceRef = useRef(null);
-  useEffect(() => { activeRef.current = active; }, [active]);
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
   const start = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return;
-    try { recogRef.current?.stop(); } catch { /**/ }
+    try {
+      recogRef.current?.stop();
+    } catch {
+      /* */
+    }
     const r = new SR();
-    r.continuous=true; r.interimResults=true; r.lang="de-DE"; r.maxAlternatives=1;
-    r.onresult = e => {
-      let interim="", finals="";
-      for (let i=e.resultIndex; i<e.results.length; i++) {
-        const t=e.results[i][0].transcript;
-        if (e.results[i].isFinal) finals+=t+" "; else interim+=t;
+    r.continuous       = true;
+    r.interimResults   = true;
+    r.lang             = "de-DE";
+    r.maxAlternatives  = 1;
+    r.onresult = (e) => {
+      let interim = "",
+        finals = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finals += t + " ";
+        else interim += t;
       }
-      if (interim) { clearTimeout(debounceRef.current); debounceRef.current=setTimeout(()=>onInterim?.(interim),80); }
-      if (finals)  { clearTimeout(debounceRef.current); onFinal?.(finals.trimEnd()); }
+      if (interim) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => onInterim?.(interim), 80);
+      }
+      if (finals) {
+        clearTimeout(debounceRef.current);
+        onFinal?.(finals.trimEnd());
+      }
     };
-    r.onerror = e => { if(e.error!=="no-speech"&&e.error!=="aborted") console.warn("SR:",e.error); };
-    r.onend   = () => { if(activeRef.current) try{r.start()}catch{/***/} };
+    r.onerror = (e) => {
+      if (e.error !== "no-speech" && e.error !== "aborted")
+        console.warn("SR:", e.error);
+    };
+    r.onend = () => {
+      if (activeRef.current) try { r.start(); } catch { /**/ }
+    };
     recogRef.current = r;
-    try { r.start(); } catch { /**/ }
+    try {
+      r.start();
+    } catch {
+      /* */
+    }
   }, [onFinal, onInterim]);
   const stop = useCallback(() => {
-    activeRef.current=false;
+    activeRef.current = false;
     clearTimeout(debounceRef.current);
-    try { recogRef.current?.stop(); } catch { /**/ }
-    recogRef.current=null;
+    try {
+      recogRef.current?.stop();
+    } catch {
+      /* */
+    }
+    recogRef.current = null;
   }, []);
   return { start, stop };
 }
@@ -268,9 +362,15 @@ function useSpeechRecognition({ onFinal, onInterim, active }) {
 function useTimerDisplay(timerEndsAt, totalSec) {
   const [tl, setTl] = useState(totalSec);
   useEffect(() => {
-    if (!timerEndsAt) { setTl(totalSec); return; }
-    const tick = () => setTl(Math.max(0,Math.round((timerEndsAt-Date.now())/1000)));
-    tick(); const id=setInterval(tick,400); return ()=>clearInterval(id);
+    if (!timerEndsAt) {
+      setTl(totalSec);
+      return;
+    }
+    const tick = () =>
+      setTl(Math.max(0, Math.round((timerEndsAt - Date.now()) / 1000)));
+    tick();
+    const id = setInterval(tick, 400);
+    return () => clearInterval(id);
   }, [timerEndsAt, totalSec]);
   return tl;
 }
@@ -279,41 +379,52 @@ function useTimerDisplay(timerEndsAt, totalSec) {
 // CircularTimer
 // ─────────────────────────────────────────────────────────────────────────────
 function CircularTimer({ timeLeft, totalTime, phase }) {
-  const R=52, C=2*Math.PI*R;
-  const offset = C*(1-timeLeft/totalTime);
-  const urgent = timeLeft<=10, warn=timeLeft<=30;
-  const color  = urgent?"#ef4444":warn?"#f59e0b":"#22d3ee";
-  const glow   = urgent?"rgba(239,68,68,.4)":warn?"rgba(245,158,11,.3)":"rgba(34,211,238,.22)";
-  const mm=String(Math.floor(timeLeft/60)).padStart(2,"0");
-  const ss=String(timeLeft%60).padStart(2,"0");
+  const R      = 52;
+  const C      = 2 * Math.PI * R;
+  const offset = C * (1 - timeLeft / totalTime);
+  const urgent = timeLeft <= 10;
+  const warn   = timeLeft <= 30;
+  const color  = urgent ? "#ef4444" : warn ? "#f59e0b" : "#22d3ee";
+  const glow   = urgent
+    ? "rgba(239,68,68,.4)"
+    : warn
+    ? "rgba(245,158,11,.3)"
+    : "rgba(34,211,238,.22)";
+  const mm = String(Math.floor(timeLeft / 60)).padStart(2, "0");
+  const ss = String(timeLeft % 60).padStart(2, "0");
   return (
-    <div className={`tmr-wrap${urgent?" tmr-urgent":""}`}>
-      <svg viewBox="0 0 120 120" width="120" height="120" style={{overflow:"visible"}}>
+    <div className={`tmr-wrap${urgent ? " tmr-urgent" : ""}`}>
+      <svg viewBox="0 0 120 120" width="120" height="120" style={{ overflow: "visible" }}>
         <defs>
           <radialGradient id="tBg" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#17203a"/><stop offset="100%" stopColor="#0a0e1a"/>
+            <stop offset="0%" stopColor="#17203a" />
+            <stop offset="100%" stopColor="#0a0e1a" />
           </radialGradient>
         </defs>
-        <circle cx="60" cy="60" r="58" fill="url(#tBg)"/>
-        <circle cx="60" cy="60" r="55" fill="none" stroke="rgba(255,255,255,.04)" strokeWidth="1"/>
-        <circle cx="60" cy="60" r={R} fill="none" stroke="rgba(255,255,255,.05)" strokeWidth="8"/>
-        <circle cx="60" cy="60" r={R} fill="none" stroke={glow} strokeWidth="10"
+        <circle cx="60" cy="60" r="58" fill="url(#tBg)" />
+        <circle cx="60" cy="60" r="55" fill="none" stroke="rgba(255,255,255,.04)" strokeWidth="1" />
+        <circle cx="60" cy="60" r={R} fill="none" stroke="rgba(255,255,255,.05)" strokeWidth="8" />
+        <circle
+          cx="60" cy="60" r={R} fill="none" stroke={glow} strokeWidth="10"
           strokeLinecap="round" strokeDasharray={C} strokeDashoffset={offset}
           transform="rotate(-90 60 60)"
-          style={{filter:"blur(4px)",transition:"stroke-dashoffset .4s linear,stroke .5s"}}/>
-        <circle cx="60" cy="60" r={R} fill="none" stroke={color} strokeWidth="7"
+          style={{ filter: "blur(4px)", transition: "stroke-dashoffset .4s linear,stroke .5s" }}
+        />
+        <circle
+          cx="60" cy="60" r={R} fill="none" stroke={color} strokeWidth="7"
           strokeLinecap="round" strokeDasharray={C} strokeDashoffset={offset}
           transform="rotate(-90 60 60)"
-          style={{transition:"stroke-dashoffset .4s linear,stroke .5s"}}/>
+          style={{ transition: "stroke-dashoffset .4s linear,stroke .5s" }}
+        />
         <text x="60" y="55" textAnchor="middle" dominantBaseline="middle"
-          fill={urgent?"#ef4444":"#f1f5f9"} fontSize="20" fontWeight="700"
-          fontFamily="'Outfit',sans-serif" style={{transition:"fill .4s"}}>
+          fill={urgent ? "#ef4444" : "#f1f5f9"} fontSize="20" fontWeight="700"
+          fontFamily="'Outfit',sans-serif" style={{ transition: "fill .4s" }}>
           {mm}:{ss}
         </text>
         <text x="60" y="73" textAnchor="middle" dominantBaseline="middle"
-          fill="rgba(148,163,184,.45)" fontSize="7" fontFamily="'Space Grotesk',sans-serif"
-          letterSpacing="1.8">
-          {phase==="prep"?"PREP":"SPRECHEN"}
+          fill="rgba(148,163,184,.45)" fontSize="7"
+          fontFamily="'Space Grotesk',sans-serif" letterSpacing="1.8">
+          {phase === "prep" ? "PREP" : "SPRECHEN"}
         </text>
       </svg>
     </div>
@@ -323,22 +434,28 @@ function CircularTimer({ timeLeft, totalTime, phase }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // LiveTranscriptPanel
 // ─────────────────────────────────────────────────────────────────────────────
-function LiveTranscriptPanel({ speakerName, text="", interim="", isMine }) {
+function LiveTranscriptPanel({ speakerName, text = "", interim = "", isMine }) {
   const bottomRef = useRef(null);
-  useEffect(() => { bottomRef.current?.scrollIntoView({behavior:"smooth"}); }, [text,interim]);
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [text, interim]);
   return (
-    <div className={`tp-panel${isMine?" tp-mine":" tp-partner"}`}>
+    <div className={`tp-panel${isMine ? " tp-mine" : " tp-partner"}`}>
       <div className="tp-head">
-        <span className="tp-dot"/>
+        <span className="tp-dot" />
         <span className="tp-speaker">{speakerName}</span>
-        <span className="tp-badge">{isMine?"Ich":"Partner"}</span>
+        <span className="tp-badge">{isMine ? "Ich" : "Partner"}</span>
       </div>
       <div className="tp-body">
-        {!text&&!interim
-          ? <span className="tp-ph">Warte auf Spracheingabe…</span>
-          : <><span className="tp-final">{text}</span>{interim&&<span className="tp-interim"> {interim}</span>}</>
-        }
-        <div ref={bottomRef}/>
+        {!text && !interim ? (
+          <span className="tp-ph">Warte auf Spracheingabe…</span>
+        ) : (
+          <>
+            <span className="tp-final">{text}</span>
+            {interim && <span className="tp-interim"> {interim}</span>}
+          </>
+        )}
+        <div ref={bottomRef} />
       </div>
     </div>
   );
@@ -347,16 +464,27 @@ function LiveTranscriptPanel({ speakerName, text="", interim="", isMine }) {
 // ─────────────────────────────────────────────────────────────────────────────
 // MusterCard — Telc B2 Beruf Teil 2 model answer display
 // ─────────────────────────────────────────────────────────────────────────────
-function MusterCard({ muster, roundNum, speakerName, isReference = false }) {
+function MusterCard({ muster, roundNum, speakerName, isReference = false, isModelAnswer = false }) {
   const parts = [
-    { key:"einleitung",  label:"Einleitung",  dot:"rc-dot-cyan",  icon:"💬" },
-    { key:"vorschlag",   label:"Vorschlag",   dot:"rc-dot-green", icon:"💡" },
-    { key:"begruendung", label:"Begründung",  dot:"rc-dot-amber", icon:"📋" },
-    { key:"schluss",     label:"Schluss",     dot:"rc-dot-cyan",  icon:"✅" },
+    { key: "einleitung",  label: "Einleitung", dot: "rc-dot-cyan",  icon: "💬" },
+    { key: "vorschlag",   label: "Vorschlag",  dot: "rc-dot-green", icon: "💡" },
+    { key: "begruendung", label: "Begründung", dot: "rc-dot-amber", icon: "📋" },
+    { key: "schluss",     label: "Schluss",    dot: "rc-dot-cyan",  icon: "✅" },
   ];
   return (
     <div className="mc-wrap">
-      {!isReference && (
+      {isModelAnswer && (
+        <div className="mc-notice mc-notice-model">
+          <span className="mc-notice-icon">🎙️</span>
+          <div>
+            <p className="mc-notice-title">Du hast diese Runde nicht gesprochen.</p>
+            <p className="mc-notice-sub">
+              Hier ist die ideale Antwort für diese Aufgabe — lies sie laut vor, um zu üben:
+            </p>
+          </div>
+        </div>
+      )}
+      {!isModelAnswer && !isReference && (
         <div className="mc-notice">
           <span className="mc-notice-icon">🎙️</span>
           <div>
@@ -368,17 +496,23 @@ function MusterCard({ muster, roundNum, speakerName, isReference = false }) {
       <div className="rc-card mc-card">
         <div className="rc-head">
           <span className="rc-round-tag">Runde {roundNum}</span>
-          <span className="mc-badge">{isReference ? "📖 Referenz" : "📖 Lernmodus"}</span>
-          {!isReference && <span className="rc-who">{speakerName}</span>}
+          <span className="mc-badge">
+            {isModelAnswer ? "📖 Musterlösung" : isReference ? "📖 Referenz" : "📖 Lernmodus"}
+          </span>
+          {!isReference && !isModelAnswer && <span className="rc-who">{speakerName}</span>}
         </div>
-        {parts.map(({key, label, dot, icon}) => muster[key] && (
-          <div key={key} className="rc-sec">
-            <div className="rc-label">
-              <span className={`rc-dot ${dot}`}/>{icon} {label}
-            </div>
-            <p className="mc-part-text">{muster[key]}</p>
-          </div>
-        ))}
+        {parts.map(
+          ({ key, label, dot, icon }) =>
+            muster[key] && (
+              <div key={key} className="rc-sec">
+                <div className="rc-label">
+                  <span className={`rc-dot ${dot}`} />
+                  {icon} {label}
+                </div>
+                <p className="mc-part-text">{muster[key]}</p>
+              </div>
+            )
+        )}
         <div className="mc-tip">
           <span className="mc-tip-icon">💡</span>
           <p>Lies diese Musterlösung laut vor, um die B2 Beruf Teil 2 Strukturen zu üben.</p>
@@ -392,19 +526,24 @@ function MusterCard({ muster, roundNum, speakerName, isReference = false }) {
 // ResultCard — normal evaluation
 // ─────────────────────────────────────────────────────────────────────────────
 function ResultCard({ result, speakerName, roundNum, isLoading }) {
-  if (isLoading) return (
-    <div className="rc-card rc-loading">
-      <svg width="36" height="36" viewBox="0 0 36 36">
-        <circle cx="18" cy="18" r="14" fill="none" stroke="rgba(34,211,238,.15)" strokeWidth="3"/>
-        <circle cx="18" cy="18" r="14" fill="none" stroke="#22d3ee" strokeWidth="3"
-          strokeLinecap="round" strokeDasharray="36 52"
-          style={{animation:"cr-spin 1s linear infinite",transformOrigin:"center"}}/>
-      </svg>
-      <p className="rc-loading-txt">KI analysiert Runde {roundNum}…</p>
-    </div>
-  );
+  if (isLoading)
+    return (
+      <div className="rc-card rc-loading">
+        <svg width="36" height="36" viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="14" fill="none" stroke="rgba(34,211,238,.15)" strokeWidth="3" />
+          <circle cx="18" cy="18" r="14" fill="none" stroke="#22d3ee" strokeWidth="3"
+            strokeLinecap="round" strokeDasharray="36 52"
+            style={{ animation: "cr-spin 1s linear infinite", transformOrigin: "center" }}
+          />
+        </svg>
+        <p className="rc-loading-txt">KI analysiert Runde {roundNum}…</p>
+      </div>
+    );
   if (!result) return null;
-  const { score=0, isOffTopic=false, correctedText, feedback, errors=[], transcript:origText } = result;
+  const {
+    score = 0, isOffTopic = false, correctedText,
+    feedback, errors = [], transcript: origText,
+  } = result;
   const html = buildHighlightedHTML(origText, errors);
   return (
     <div className="rc-card">
@@ -413,34 +552,50 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
         {isOffTopic && <span className="rc-offtopic-badge">⚠ Off-topic</span>}
         <span className="rc-who">{speakerName}</span>
         <div className="rc-score-bar">
-          {[1,2,3,4,5].map(b=>(
-            <div key={b} className={`rc-bar-seg${b<=score?" rc-bar-on":""}`} style={{"--bh":`${b*5+6}px`}}/>
+          {[1, 2, 3, 4, 5].map((b) => (
+            <div
+              key={b}
+              className={`rc-bar-seg${b <= score ? " rc-bar-on" : ""}`}
+              style={{ "--bh": `${b * 5 + 6}px` }}
+            />
           ))}
-          <span className="rc-score-val">{score}<span className="rc-score-of">/5</span></span>
+          <span className="rc-score-val">
+            {score}
+            <span className="rc-score-of">/5</span>
+          </span>
         </div>
       </div>
       {origText && (
         <div className="rc-sec">
-          <div className="rc-label"><span className="rc-dot rc-dot-red"/>Original · Fehler markiert</div>
-          <div className="rc-orig" dangerouslySetInnerHTML={{__html:html}}/>
+          <div className="rc-label">
+            <span className="rc-dot rc-dot-red" />
+            Original · Fehler markiert
+          </div>
+          <div className="rc-orig" dangerouslySetInnerHTML={{ __html: html }} />
         </div>
       )}
       {correctedText && (
         <div className="rc-sec">
-          <div className="rc-label"><span className="rc-dot rc-dot-green"/>Korrigierte Version</div>
+          <div className="rc-label">
+            <span className="rc-dot rc-dot-green" />
+            Korrigierte Version
+          </div>
           <div className="rc-corr">{correctedText}</div>
         </div>
       )}
-      {errors.length>0 && (
+      {errors.length > 0 && (
         <div className="rc-sec">
-          <div className="rc-label"><span className="rc-dot rc-dot-amber"/>Fehler ({errors.length})</div>
+          <div className="rc-label">
+            <span className="rc-dot rc-dot-amber" />
+            Fehler ({errors.length})
+          </div>
           <div className="rc-errs">
-            {errors.map((e,i)=>(
+            {errors.map((e, i) => (
               <div key={i} className="rc-err-row">
                 <span className="rc-err-orig">{e.original}</span>
                 <span className="rc-err-arr">→</span>
                 <span className="rc-err-fix">{e.correction}</span>
-                {e.explanation&&<span className="rc-err-exp">{e.explanation}</span>}
+                {e.explanation && <span className="rc-err-exp">{e.explanation}</span>}
               </div>
             ))}
           </div>
@@ -448,7 +603,10 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
       )}
       {feedback && (
         <div className="rc-sec rc-sec-last">
-          <div className="rc-label"><span className="rc-dot rc-dot-cyan"/>Feedback</div>
+          <div className="rc-label">
+            <span className="rc-dot rc-dot-cyan" />
+            Feedback
+          </div>
           <p className="rc-feedback">{feedback}</p>
         </div>
       )}
@@ -458,27 +616,48 @@ function ResultCard({ result, speakerName, roundNum, isLoading }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ResultsView — unified dispatcher
-//   isLearningMode=true  → MusterCard (full)
-//   isLearningMode=false → ResultCard + optional collapsible MusterCard
+//   isModelAnswer=true   → MusterCard (no score, B2 fallback)
+//   isLearningMode=true  → MusterCard (learning, no transcript)
+//   otherwise            → ResultCard + optional collapsible MusterCard
 // ─────────────────────────────────────────────────────────────────────────────
 function ResultsView({ result, roundNum, speakerName, isLoading }) {
-  if (isLoading) return <ResultCard result={null} speakerName={speakerName} roundNum={roundNum} isLoading/>;
-  if (!result)   return null;
+  if (isLoading)
+    return <ResultCard result={null} speakerName={speakerName} roundNum={roundNum} isLoading />;
+  if (!result) return null;
+
+  // FIX 4: model-answer branch (empty transcript fallback)
+  if (result.isModelAnswer && result.muster) {
+    return (
+      <MusterCard
+        muster={result.muster}
+        roundNum={roundNum}
+        speakerName={speakerName}
+        isModelAnswer
+      />
+    );
+  }
 
   if (result.isLearningMode && result.muster) {
-    return <MusterCard muster={result.muster} roundNum={roundNum} speakerName={speakerName}/>;
+    return (
+      <MusterCard muster={result.muster} roundNum={roundNum} speakerName={speakerName} />
+    );
   }
 
   return (
     <>
-      <ResultCard result={result} speakerName={speakerName} roundNum={roundNum} isLoading={false}/>
+      <ResultCard result={result} speakerName={speakerName} roundNum={roundNum} isLoading={false} />
       {result.muster && (
         <details className="muster-ref-details">
           <summary className="muster-ref-summary">
             <span>📖</span> Musterlösung als Referenz anzeigen
           </summary>
-          <div style={{padding:"16px"}}>
-            <MusterCard muster={result.muster} roundNum={roundNum} speakerName={speakerName} isReference/>
+          <div style={{ padding: "16px" }}>
+            <MusterCard
+              muster={result.muster}
+              roundNum={roundNum}
+              speakerName={speakerName}
+              isReference
+            />
           </div>
         </details>
       )}
@@ -495,17 +674,24 @@ function AnalyzingOverlay({ speakerName }) {
       <div className="ol-card">
         <div className="ol-ring">
           <svg width="68" height="68" viewBox="0 0 68 68">
-            <circle cx="34" cy="34" r="28" fill="none" stroke="rgba(34,211,238,.1)" strokeWidth="4"/>
+            <circle cx="34" cy="34" r="28" fill="none" stroke="rgba(34,211,238,.1)" strokeWidth="4" />
             <circle cx="34" cy="34" r="28" fill="none" stroke="#22d3ee" strokeWidth="4"
               strokeLinecap="round" strokeDasharray="52 124"
-              style={{animation:"cr-spin 1.1s linear infinite",transformOrigin:"center"}}/>
+              style={{ animation: "cr-spin 1.1s linear infinite", transformOrigin: "center" }}
+            />
           </svg>
           <span className="ol-emoji">🤖</span>
         </div>
         <h3 className="ol-title">KI-Analyse läuft…</h3>
-        <p className="ol-sub">{speakerName}s Antwort wird ausgewertet.<br/>Einen Moment bitte.</p>
+        <p className="ol-sub">
+          {speakerName}s Antwort wird ausgewertet.
+          <br />
+          Einen Moment bitte.
+        </p>
         <div className="ol-dots">
-          {[0,.2,.4].map((d,i)=><span key={i} className="ol-dot" style={{animationDelay:`${d}s`}}/>)}
+          {[0, 0.2, 0.4].map((d, i) => (
+            <span key={i} className="ol-dot" style={{ animationDelay: `${d}s` }} />
+          ))}
         </div>
       </div>
     </div>
@@ -513,7 +699,7 @@ function AnalyzingOverlay({ speakerName }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LearningOverlay — shown while fetching Musterlösung
+// LearningOverlay
 // ─────────────────────────────────────────────────────────────────────────────
 function LearningOverlay() {
   return (
@@ -521,17 +707,24 @@ function LearningOverlay() {
       <div className="ol-card ol-learn-card">
         <div className="ol-ring">
           <svg width="68" height="68" viewBox="0 0 68 68">
-            <circle cx="34" cy="34" r="28" fill="none" stroke="rgba(251,191,36,.1)" strokeWidth="4"/>
+            <circle cx="34" cy="34" r="28" fill="none" stroke="rgba(251,191,36,.1)" strokeWidth="4" />
             <circle cx="34" cy="34" r="28" fill="none" stroke="#fbbf24" strokeWidth="4"
               strokeLinecap="round" strokeDasharray="52 124"
-              style={{animation:"cr-spin 1.1s linear infinite",transformOrigin:"center"}}/>
+              style={{ animation: "cr-spin 1.1s linear infinite", transformOrigin: "center" }}
+            />
           </svg>
           <span className="ol-emoji">📖</span>
         </div>
         <h3 className="ol-title">Lernmodus</h3>
-        <p className="ol-sub">Musterlösung wird generiert…<br/>Telc B2 Beruf · Teil 2</p>
+        <p className="ol-sub">
+          Musterlösung wird generiert…
+          <br />
+          Telc B2 Beruf · Teil 2
+        </p>
         <div className="ol-dots">
-          {[0,.2,.4].map((d,i)=><span key={i} className="ol-dot ol-dot-am" style={{animationDelay:`${d}s`}}/>)}
+          {[0, 0.2, 0.4].map((d, i) => (
+            <span key={i} className="ol-dot ol-dot-am" style={{ animationDelay: `${d}s` }} />
+          ))}
         </div>
       </div>
     </div>
@@ -549,8 +742,12 @@ function ExitModal({ onConfirm, onCancel }) {
         <h3 className="modal-title">Übung beenden?</h3>
         <p className="modal-body">Dein Fortschritt wird nicht gespeichert.</p>
         <div className="modal-btns">
-          <button className="modal-btn modal-btn-d" onClick={onConfirm}>Ja, beenden</button>
-          <button className="modal-btn modal-btn-g" onClick={onCancel}>Weitermachen</button>
+          <button className="modal-btn modal-btn-d" onClick={onConfirm}>
+            Ja, beenden
+          </button>
+          <button className="modal-btn modal-btn-g" onClick={onCancel}>
+            Weitermachen
+          </button>
         </div>
       </div>
     </div>
@@ -570,237 +767,373 @@ const DEF_RDMT = [
   "Das hat den Vorteil / Nachteil, dass …",
   "Was ich damit sagen möchte, ist …",
 ];
-function RedemittelPanel({ items=[] }) {
-  const [open,setOpen]=useState(false);
-  const list=items.length?items:DEF_RDMT;
+function RedemittelPanel({ items = [] }) {
+  const [open, setOpen] = useState(false);
+  const list = items.length ? items : DEF_RDMT;
   return (
-    <div className={`rdm${open?" rdm-open":""}`}>
-      <button className="rdm-toggle" onClick={()=>setOpen(o=>!o)}>
-        <span>{open?"▾":"▸"}</span><span>Redemittel</span>
+    <div className={`rdm${open ? " rdm-open" : ""}`}>
+      <button className="rdm-toggle" onClick={() => setOpen((o) => !o)}>
+        <span>{open ? "▾" : "▸"}</span>
+        <span>Redemittel</span>
         <span className="rdm-cnt">{list.length}</span>
       </button>
-      {open&&<ul className="rdm-list">
-        {list.map((item,i)=>(
-          <li key={i} className="rdm-item"><span className="rdm-dot"/>{item}</li>
-        ))}
-      </ul>}
+      {open && (
+        <ul className="rdm-list">
+          {list.map((item, i) => (
+            <li key={i} className="rdm-item">
+              <span className="rdm-dot" />
+              {item}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
 
-function MicOnIcon()  { return <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" fill="currentColor"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>; }
-function MicOffIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" fill="none"><line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>; }
+function MicOnIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+      <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" fill="currentColor" />
+      <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+function MicOffIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+      <line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path d="M9 9v3a3 3 0 005.12 2.12M15 9.34V4a3 3 0 00-5.94-.6M17 16.95A7 7 0 015 12v-2m14 0v2M12 19v4M8 23h8"
+        stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
 export default function ChallengeRoom({
-  mode        = "solo",
-  roomId      = null,
+  mode         = "solo",
+  roomId       = null,
   currentUser,
-  questions   : propQ = [],
+  questions    : propQ = [],
   onExit,
-  heroBgImage = "/hero-bg.jpg",
+  heroBgImage  = "/hero-bg.jpg",
 }) {
-  const me     = currentUser || { uid:"demo", displayName:"Du" };
-  const isSolo = mode==="solo";
-  const isMulti= mode==="multi";
+  const me     = currentUser || { uid: "demo", displayName: "Du" };
+  const isSolo = mode === "solo";
+  const isMulti = mode === "multi";
 
   const [rs, setRs] = useState({
-    status:"intro", currentSpeaker:me.uid, timerPhase:"prep",
-    timerEndsAt:null, currentQuestionId:null, round:1,
-    speakerOrder:[me.uid],
+    status: "intro",
+    currentSpeaker: me.uid,
+    timerPhase: "prep",
+    timerEndsAt: null,
+    currentQuestionId: null,
+    round: 1,
+    speakerOrder: [me.uid],
   });
-  const [transcripts,   setTranscripts]   = useState({});
-  const [roundResults,  setRoundResults]  = useState({});
-  const [analyzingMap,  setAnalyzingMap]  = useState({});
-  const [isLearningMode,setIsLearningMode]= useState(false);
-  const [partnerUid,    setPartnerUid]    = useState(null);
-  const [partnerName,   setPartnerName]   = useState("Partner");
-  const [fbReady,       setFbReady]       = useState(!isMulti);
-  const [isRecording,     setIsRecording]     = useState(false);
-  const [showExitConfirm, setShowExitConfirm] = useState(false);
-  const [phaseAnim,       setPhaseAnim]       = useState("in");
-  const [soloUsedIds,     setSoloUsedIds]     = useState([]);
+  const [transcripts,    setTranscripts]    = useState({});
+  const [roundResults,   setRoundResults]   = useState({});
+  const [analyzingMap,   setAnalyzingMap]   = useState({});
+  const [isLearningMode, setIsLearningMode] = useState(false);
+
+  // FIX 1: store the full `players` object from Firebase to derive rotation
+  const [players,        setPlayers]        = useState({});
+  const [partnerUid,     setPartnerUid]     = useState(null);
+  const [partnerName,    setPartnerName]    = useState("Partner");
+  const [fbReady,        setFbReady]        = useState(!isMulti);
+  const [isRecording,    setIsRecording]    = useState(false);
+  const [showExitConfirm,setShowExitConfirm]= useState(false);
+  const [phaseAnim,      setPhaseAnim]      = useState("in");
+  const [soloUsedIds,    setSoloUsedIds]    = useState([]);
 
   const transcriptRef   = useRef("");
   const rsRef           = useRef(rs);
   const partnerUidRef   = useRef(null);
+  const playersRef      = useRef({});          // FIX 1: live players ref
   const masterTimerRef  = useRef(null);
   const masterEndsAtRef = useRef(null);
   const currentQRef     = useRef(null);
 
-  useEffect(()=>{ rsRef.current=rs; },[rs]);
-  useEffect(()=>{ partnerUidRef.current=partnerUid; },[partnerUid]);
-  useEffect(()=>()=>clearInterval(masterTimerRef.current),[]);
+  useEffect(() => { rsRef.current = rs; }, [rs]);
+  useEffect(() => { partnerUidRef.current = partnerUid; }, [partnerUid]);
+  useEffect(() => { playersRef.current = players; }, [players]);
+  useEffect(() => () => clearInterval(masterTimerRef.current), []);
 
   const status    = rs.status;
-  const amSpeaker = rs.currentSpeaker===me.uid;
-  const totalSec  = rs.timerPhase==="prep"?PREP_SEC:SPEAK_SEC;
-  const currentQ  = propQ.find(q=>q.id===rs.currentQuestionId)||null;
-  useEffect(()=>{ currentQRef.current=currentQ; },[currentQ]);
+  const amSpeaker = rs.currentSpeaker === me.uid;
+  const totalSec  = rs.timerPhase === "prep" ? PREP_SEC : SPEAK_SEC;
+  const currentQ  = propQ.find((q) => q.id === rs.currentQuestionId) || null;
+  useEffect(() => { currentQRef.current = currentQ; }, [currentQ]);
 
   const roundKey           = `round${rs.round}`;
   const anyAnalyzing       = Object.values(analyzingMap).some(Boolean);
-  const speakerTx          = transcripts[rs.currentSpeaker]||{text:"",interim:""};
-  const currentRoundResult = roundResults[roundKey]||null;
-  const round1Result       = roundResults["round1"]||null;
-  const round2Result       = roundResults["round2"]||null;
-  const speakerDisplayName = rs.currentSpeaker===me.uid ? me.displayName : partnerName;
+  const speakerTx          = transcripts[rs.currentSpeaker] || { text: "", interim: "" };
+  const currentRoundResult = roundResults[roundKey] || null;
+  const round1Result       = roundResults["round1"] || null;
+  const round2Result       = roundResults["round2"] || null;
+  const speakerDisplayName =
+    rs.currentSpeaker === me.uid ? me.displayName : partnerName;
   const isSpeakerAnalyzing = !!analyzingMap[rs.currentSpeaker];
   const timeLeft           = useTimerDisplay(rs.timerEndsAt, totalSec);
 
-  // ── Firebase listeners ────────────────────────────────────────────────────
-  useEffect(()=>{
-    if (!isMulti||!roomId) return;
-    const cls=[];
-    (async()=>{
-      cls.push(await fbListen(`rooms/${roomId}/players`, players=>{
-        if (!players) return;
-        const amA = players.A?.uid===me.uid;
-        const p   = amA?players.B:players.A;
-        if (p?.displayName) setPartnerName(p.displayName);
-        if (p?.uid)         setPartnerUid(p.uid);
-      }));
-      cls.push(await fbListen(`rooms/${roomId}/roomState`, data=>{
-        setFbReady(true);
-        if (!data) return;
-        setRs(prev=>({...prev,...data}));
-        if (data.currentSpeaker===me.uid && data.timerEndsAt && data.timerEndsAt!==masterEndsAtRef.current) {
-          masterEndsAtRef.current=data.timerEndsAt;
-          _startCountdown(data.timerEndsAt, data.timerPhase, data.currentQuestionId);
-        } else if (data.currentSpeaker!==me.uid) {
-          clearInterval(masterTimerRef.current);
-          masterEndsAtRef.current=null;
-        }
-      }));
-      cls.push(await fbListen(`rooms/${roomId}/transcript`, data=>{
-        if (!data) return;
-        setTranscripts(prev=>({...prev,...data}));
-        if (data[me.uid]?.text!==undefined) transcriptRef.current=data[me.uid].text||"";
-      }));
-      cls.push(await fbListen(`rooms/${roomId}/results`, data=>{
-        if (data) setRoundResults(data);
-      }));
-      cls.push(await fbListen(`rooms/${roomId}/analyzing`, data=>{
-        setAnalyzingMap(data||{});
-      }));
+  // ── FIX 2: Firebase listeners with full cleanup on roomId change ──────────
+  useEffect(() => {
+    if (!isMulti || !roomId) return;
+
+    // Hard reset local state before attaching new listeners
+    setTranscripts({});
+    setRoundResults({});
+    setAnalyzingMap({});
+    setIsLearningMode(false);
+    transcriptRef.current = "";
+
+    const cleanupFns = [];
+    let mounted = true;
+
+    (async () => {
+      // Players listener — used for round-robin rotation (FIX 1)
+      cleanupFns.push(
+        await fbListen(`rooms/${roomId}/players`, (playersData) => {
+          if (!mounted || !playersData) return;
+          setPlayers(playersData);
+          const amA = playersData.A?.uid === me.uid;
+          const p   = amA ? playersData.B : playersData.A;
+          if (p?.displayName) setPartnerName(p.displayName);
+          if (p?.uid)         setPartnerUid(p.uid);
+        })
+      );
+
+      // Room state listener
+      cleanupFns.push(
+        await fbListen(`rooms/${roomId}/roomState`, (data) => {
+          if (!mounted) return;
+          setFbReady(true);
+          if (!data) return;
+          setRs((prev) => ({ ...prev, ...data }));
+          if (
+            data.currentSpeaker === me.uid &&
+            data.timerEndsAt &&
+            data.timerEndsAt !== masterEndsAtRef.current
+          ) {
+            masterEndsAtRef.current = data.timerEndsAt;
+            _startCountdown(data.timerEndsAt, data.timerPhase, data.currentQuestionId);
+          } else if (data.currentSpeaker !== me.uid) {
+            clearInterval(masterTimerRef.current);
+            masterEndsAtRef.current = null;
+          }
+        })
+      );
+
+      // Transcript listener
+      cleanupFns.push(
+        await fbListen(`rooms/${roomId}/transcript`, (data) => {
+          if (!mounted || !data) return;
+          setTranscripts((prev) => ({ ...prev, ...data }));
+          if (data[me.uid]?.text !== undefined) {
+            transcriptRef.current = data[me.uid].text || "";
+          }
+        })
+      );
+
+      // FIX 3: Results listener — maps every key directly into roundResults state
+      // Both users react reactively; the Round-Progress dots re-render via state.
+      cleanupFns.push(
+        await fbListen(`rooms/${roomId}/results`, (data) => {
+          if (!mounted) return;
+          // Overwrite entire roundResults so stale keys don't persist
+          setRoundResults(data || {});
+        })
+      );
+
+      // Analyzing listener
+      cleanupFns.push(
+        await fbListen(`rooms/${roomId}/analyzing`, (data) => {
+          if (!mounted) return;
+          setAnalyzingMap(data || {});
+        })
+      );
     })();
-    return ()=>cls.forEach(fn=>fn?.());
-  },[isMulti,roomId]);
 
-  const pushRS = useCallback(async partial=>{
-    if (isMulti&&roomId) { await fbUpdate(`rooms/${roomId}/roomState`, partial); }
-    else { setRs(prev=>({...prev,...partial})); }
-  },[isMulti,roomId]);
+    // FIX 2: cleanup tears down ALL listeners when roomId changes or unmounts
+    return () => {
+      mounted = false;
+      cleanupFns.forEach((fn) => fn?.());
+      clearInterval(masterTimerRef.current);
+      masterEndsAtRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMulti, roomId]);
 
-  const writeTx = useCallback(async(field,value)=>{
-    if (isMulti&&roomId) {
-      await fbSet(`rooms/${roomId}/transcript/${me.uid}/${field}`, value);
-    } else {
-      setTranscripts(prev=>({...prev,[me.uid]:{...(prev[me.uid]||{}),[field]:value}}));
-      if (field==="text") transcriptRef.current=value;
-    }
-  },[isMulti,roomId,me.uid]);
+  const pushRS = useCallback(
+    async (partial) => {
+      if (isMulti && roomId) {
+        await fbUpdate(`rooms/${roomId}/roomState`, partial);
+      } else {
+        setRs((prev) => ({ ...prev, ...partial }));
+      }
+    },
+    [isMulti, roomId]
+  );
+
+  const writeTx = useCallback(
+    async (field, value) => {
+      if (isMulti && roomId) {
+        await fbSet(`rooms/${roomId}/transcript/${me.uid}/${field}`, value);
+      } else {
+        setTranscripts((prev) => ({
+          ...prev,
+          [me.uid]: { ...(prev[me.uid] || {}), [field]: value },
+        }));
+        if (field === "text") transcriptRef.current = value;
+      }
+    },
+    [isMulti, roomId, me.uid]
+  );
 
   function _startCountdown(endsAt, phase, questionId) {
     clearInterval(masterTimerRef.current);
-    masterTimerRef.current=setInterval(()=>{
-      const left=Math.max(0,Math.round((endsAt-Date.now())/1000));
-      if (left<=0) {
+    masterTimerRef.current = setInterval(() => {
+      const left = Math.max(0, Math.round((endsAt - Date.now()) / 1000));
+      if (left <= 0) {
         clearInterval(masterTimerRef.current);
-        masterEndsAtRef.current=null;
-        if (phase==="prep") {
-          const q=propQ.find(q=>q.id===(questionId||rsRef.current.currentQuestionId));
-          _doBeginSpeaking(q);
-        } else { handleSpeakEnd(); }
+        masterEndsAtRef.current = null;
+        if (phase === "prep") {
+          _doBeginSpeaking();
+        } else {
+          handleSpeakEnd();
+        }
       }
-    },400);
+    }, 400);
   }
 
-  const handleFinal = useCallback(raw=>{
-    const clean=sanitize(transcriptRef.current,raw);
-    if (!clean) return;
-    const updated=(transcriptRef.current+(transcriptRef.current?" ":"")+clean).replace(/\s{2,}/g," ").trim();
-    transcriptRef.current=updated;
-    writeTx("text",updated);
-    writeTx("interim","");
-  },[writeTx]);
+  const handleFinal = useCallback(
+    (raw) => {
+      const clean = sanitize(transcriptRef.current, raw);
+      if (!clean) return;
+      const updated = (
+        transcriptRef.current + (transcriptRef.current ? " " : "") + clean
+      )
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      transcriptRef.current = updated;
+      writeTx("text", updated);
+      writeTx("interim", "");
+    },
+    [writeTx]
+  );
 
-  const handleInterim = useCallback(text=>{ writeTx("interim",text); },[writeTx]);
-  const micActive = status==="speaking" && amSpeaker && isRecording;
+  const handleInterim = useCallback(
+    (text) => { writeTx("interim", text); },
+    [writeTx]
+  );
+  const micActive = status === "speaking" && amSpeaker && isRecording;
 
-  const {start:startRecog,stop:stopRecog} = useSpeechRecognition({
-    onFinal:handleFinal, onInterim:handleInterim, active:micActive,
+  const { start: startRecog, stop: stopRecog } = useSpeechRecognition({
+    onFinal: handleFinal,
+    onInterim: handleInterim,
+    active: micActive,
   });
-  useEffect(()=>{
-    if (micActive) startRecog(); else stopRecog();
-    return ()=>stopRecog();
-  },[micActive]);
+  useEffect(() => {
+    if (micActive) startRecog();
+    else stopRecog();
+    return () => stopRecog();
+  }, [micActive]);
 
   function anim(cb) {
     setPhaseAnim("out");
-    setTimeout(()=>{ cb?.(); setPhaseAnim("in"); },200);
+    setTimeout(() => {
+      cb?.();
+      setPhaseAnim("in");
+    }, 200);
   }
   function handleExitRequest() {
-    if (anyAnalyzing||isLearningMode) return;
-    if (status==="intro"||status==="finished") { onExit?.(); return; }
+    if (anyAnalyzing || isLearningMode) return;
+    if (status === "intro" || status === "finished") { onExit?.(); return; }
     setShowExitConfirm(true);
   }
 
-  async function beginPrep(speakerUid, roundNum) {
-    if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
-    transcriptRef.current="";
+  // FIX 2: hard-reset local transcript + round state before each new round
+  async function _hardResetRound() {
+    transcriptRef.current = "";
     setIsLearningMode(false);
-    if (isMulti&&roomId) {
-      await fbSet(`rooms/${roomId}/transcript/${me.uid}`,{text:"",interim:"",updatedAt:Date.now()});
-      const pUid=partnerUidRef.current;
-      if (pUid) await fbSet(`rooms/${roomId}/transcript/${pUid}`,{text:"",interim:"",updatedAt:Date.now()});
-    } else { setTranscripts({}); }
-    const usedIds=isSolo?soloUsedIds:[];
-    const q=pickRandom(propQ,usedIds);
+    setTranscripts({});
+    if (isMulti && roomId) {
+      await Promise.all([
+        fbSet(`rooms/${roomId}/transcript/${me.uid}`, {
+          text: "", interim: "", updatedAt: Date.now(),
+        }),
+        partnerUidRef.current
+          ? fbSet(`rooms/${roomId}/transcript/${partnerUidRef.current}`, {
+              text: "", interim: "", updatedAt: Date.now(),
+            })
+          : Promise.resolve(),
+      ]);
+    }
+  }
+
+  async function beginPrep(speakerUid, roundNum) {
+    if (isMulti && rsRef.current.currentSpeaker !== me.uid) return;
+    await _hardResetRound();
+
+    const usedIds = isSolo ? soloUsedIds : [];
+    const q = pickRandom(propQ, usedIds);
     if (!q) { console.warn("No questions"); return; }
-    if (isSolo) setSoloUsedIds(p=>[...p,q.id]);
-    const endsAt=Date.now()+PREP_SEC*1000;
+    if (isSolo) setSoloUsedIds((p) => [...p, q.id]);
+
+    const endsAt = Date.now() + PREP_SEC * 1000;
     await pushRS({
-      status:"prep", currentSpeaker:speakerUid||me.uid,
-      timerPhase:"prep", timerEndsAt:endsAt,
-      currentQuestionId:q.id, round:roundNum||1,
+      status: "prep",
+      currentSpeaker: speakerUid || me.uid,
+      timerPhase: "prep",
+      timerEndsAt: endsAt,
+      currentQuestionId: q.id,
+      round: roundNum || 1,
     });
-    if (isSolo) { masterEndsAtRef.current=endsAt; _startCountdown(endsAt,"prep",q.id); }
+    if (isSolo) {
+      masterEndsAtRef.current = endsAt;
+      _startCountdown(endsAt, "prep", q.id);
+    }
     anim();
   }
 
   async function _doBeginSpeaking() {
-    if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
+    if (isMulti && rsRef.current.currentSpeaker !== me.uid) return;
     clearInterval(masterTimerRef.current);
     setIsRecording(true);
-    playBeep({freq:660,gain:.4});
-    const endsAt=Date.now()+SPEAK_SEC*1000;
-    await pushRS({status:"speaking",timerPhase:"speak",timerEndsAt:endsAt});
-    if (isSolo) { masterEndsAtRef.current=endsAt; _startCountdown(endsAt,"speak",null); }
+    playBeep({ freq: 660, gain: 0.4 });
+    const endsAt = Date.now() + SPEAK_SEC * 1000;
+    await pushRS({ status: "speaking", timerPhase: "speak", timerEndsAt: endsAt });
+    if (isSolo) {
+      masterEndsAtRef.current = endsAt;
+      _startCountdown(endsAt, "speak", null);
+    }
     anim();
   }
 
   async function handleSkipPrep() {
     if (!amSpeaker) return;
-    clearInterval(masterTimerRef.current); masterEndsAtRef.current=null;
+    clearInterval(masterTimerRef.current);
+    masterEndsAtRef.current = null;
     await _doBeginSpeaking();
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // handleSpeakEnd — v9 Learning Mode branch
+  // handleSpeakEnd — FIX 3 + FIX 4
   //
-  // Decision:
-  //   hasContent(transcript)?
-  //     YES → normal eval (fetchAI) + muster as reference (parallel)
-  //     NO  → Learning Mode: fetch Musterlösung, skip grading entirely
+  // FIX 3: aiResult is written to Firebase BEFORE status → "results",
+  //   so the Firebase results listener populates both clients atomically.
+  //
+  // FIX 4: empty transcript → skip AI call entirely, write isModelAnswer payload.
   // ─────────────────────────────────────────────────────────────────────────
   async function handleSpeakEnd() {
-    if (isMulti && rsRef.current.currentSpeaker!==me.uid) return;
-    clearInterval(masterTimerRef.current); masterEndsAtRef.current=null;
-    setIsRecording(false); stopRecog();
-    playBeep({freq:440,gain:.3});
+    if (isMulti && rsRef.current.currentSpeaker !== me.uid) return;
+    clearInterval(masterTimerRef.current);
+    masterEndsAtRef.current = null;
+    setIsRecording(false);
+    stopRecog();
+    playBeep({ freq: 440, gain: 0.3 });
 
     const finalText      = transcriptRef.current;
     const curRound       = rsRef.current.round;
@@ -810,21 +1143,22 @@ export default function ChallengeRoom({
     const topicText      = q?.topic    || "";
     const spokeSomething = hasContent(finalText);
 
-    const flagPath = isMulti&&roomId ? `rooms/${roomId}/analyzing/${me.uid}` : null;
+    const flagPath = isMulti && roomId ? `rooms/${roomId}/analyzing/${me.uid}` : null;
 
-    // Set flag + status in parallel (don't block AI call)
+    // Set analyzing flag + status simultaneously
     await Promise.all([
       flagPath
         ? fbSet(flagPath, true)
-        : Promise.resolve(setAnalyzingMap(p=>({...p,[me.uid]:true}))),
-      pushRS({status:"analyzing", timerEndsAt:null}),
+        : Promise.resolve(setAnalyzingMap((p) => ({ ...p, [me.uid]: true }))),
+      pushRS({ status: "analyzing", timerEndsAt: null }),
     ]);
     anim();
 
     try {
       if (spokeSomething) {
         // ══ NORMAL PATH ══════════════════════════════════════════════════════
-        // Evaluate transcript AND fetch muster reference in parallel
+        // FIX 3: evaluate AND fetch muster reference in parallel,
+        //   then write result to Firebase FIRST, then flip status.
         setIsLearningMode(false);
 
         const [aiResult, muster] = await Promise.all([
@@ -834,71 +1168,123 @@ export default function ChallengeRoom({
 
         const payload = {
           ...(aiResult || {
-            score: 2, isOffTopic: false,
-            correctedText: "", feedback: "Keine Auswertung verfügbar.", errors: [],
+            score: 2,
+            isOffTopic: false,
+            correctedText: "",
+            feedback: "Keine Auswertung verfügbar.",
+            errors: [],
           }),
-          transcript    : finalText,
-          speakerUid    : me.uid,
+          transcript:     finalText,
+          speakerUid:     me.uid,
+          isModelAnswer:  false,
           isLearningMode: false,
-          muster        : muster,   // attached as collapsible reference
+          muster:         muster,  // collapsible reference
+          savedAt:        Date.now(),
         };
 
-        if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
-        else setRoundResults(p=>({...p,[curRKey]:payload}));
-        await pushRS({status:"results"});
+        // FIX 3: write results before setting status so both clients
+        //   get the data from the results listener before rendering
+        if (isMulti && roomId) {
+          await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
+        } else {
+          setRoundResults((p) => ({ ...p, [curRKey]: payload }));
+        }
+        await pushRS({ status: "results" });
         anim();
 
       } else {
-        // ══ LEARNING MODE ════════════════════════════════════════════════════
-        // User was silent → show Musterlösung, no score given
+        // ══ FIX 4: MODEL ANSWER PATH ═════════════════════════════════════════
+        // User was silent → do NOT call AI evaluator (save credits).
+        // Fetch Musterlösung and write with isModelAnswer: true flag.
         setIsLearningMode(true);
 
         const muster = await fetchModelAnswer(questionText, topicText);
 
         const payload = {
-          score         : 0,
-          isOffTopic    : false,
-          isLearningMode: true,
-          transcript    : "",
-          speakerUid    : me.uid,
-          muster        : muster,
-          correctedText : "",
-          feedback      : "Du hast diese Runde nicht gesprochen. Übe mit der Musterlösung.",
-          errors        : [],
+          score:          0,
+          isOffTopic:     false,
+          isModelAnswer:  true,   // FIX 4: distinguishing flag
+          isLearningMode: true,   // kept for backward compat
+          transcript:     "",
+          speakerUid:     me.uid,
+          muster:         muster,
+          correctedText:  "",
+          feedback:
+            "Du hast keine Antwort gegeben. Hier ist die ideale Antwort — übe damit!",
+          errors:         [],
+          savedAt:        Date.now(),
         };
 
-        if (isMulti&&roomId) await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
-        else setRoundResults(p=>({...p,[curRKey]:payload}));
+        // FIX 3: write to Firebase before flipping status
+        if (isMulti && roomId) {
+          await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
+        } else {
+          setRoundResults((p) => ({ ...p, [curRKey]: payload }));
+        }
 
         setIsLearningMode(false);
-        await pushRS({status:"results"});
+        await pushRS({ status: "results" });
         anim();
       }
-
-    } catch(err) {
+    } catch (err) {
       console.error("Round-end error:", err);
       setIsLearningMode(false);
-      await pushRS({status:"results"});
+      await pushRS({ status: "results" });
       anim();
     } finally {
       if (flagPath) await fbSet(flagPath, false);
-      else setAnalyzingMap(p=>({...p,[me.uid]:false}));
+      else setAnalyzingMap((p) => ({ ...p, [me.uid]: false }));
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // FIX 1: Dynamic Round-Robin Rotation
+  //
+  // Derives next speaker from the live `players` object (slots A / B).
+  // This ensures correct alternation regardless of join order and avoids
+  // the stale static array that caused the original bug.
+  // ─────────────────────────────────────────────────────────────────────────
   async function handleNextRound() {
     if (!amSpeaker) return;
-    const order=rsRef.current.speakerOrder||[me.uid,partnerUidRef.current||me.uid];
-    const nextSpeaker=order[rsRef.current.round%order.length]||partnerUidRef.current||me.uid;
-    await pushRS({status:"switching",round:rsRef.current.round+1,currentSpeaker:nextSpeaker,timerEndsAt:null});
+
+    const nextRound = rsRef.current.round + 1;
+    let nextSpeaker;
+
+    if (isMulti) {
+      // Derive the two UIDs from the live players map
+      const pl      = playersRef.current || {};
+      const uidA    = pl.A?.uid;
+      const uidB    = pl.B?.uid;
+      const current = rsRef.current.currentSpeaker;
+
+      if (uidA && uidB) {
+        // Flip: if current is A → next is B, and vice versa
+        nextSpeaker = current === uidA ? uidB : uidA;
+      } else {
+        // Fallback: use partnerUid if only one slot resolved
+        nextSpeaker = partnerUidRef.current || me.uid;
+      }
+    } else {
+      // Solo: always me
+      nextSpeaker = me.uid;
+    }
+
+    // Push the flip to Firebase atomically so both clients see the new speaker
+    await pushRS({
+      status:         "switching",
+      round:          nextRound,
+      currentSpeaker: nextSpeaker,
+      timerEndsAt:    null,
+    });
     anim();
   }
+
   async function handleStartMyRound() {
     if (!amSpeaker) return;
     await beginPrep(me.uid, rsRef.current.round);
   }
   async function handleFinish() {
-    await pushRS({status:"finished"});
+    await pushRS({ status: "finished" });
     anim();
   }
 
@@ -908,21 +1294,26 @@ export default function ChallengeRoom({
   return (
     <>
       <style>{CSS}</style>
-      <link rel="preconnect" href="https://fonts.googleapis.com"/>
-      <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous"/>
-      <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+      <link rel="preconnect" href="https://fonts.googleapis.com" />
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+      <link
+        href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet"
+      />
 
       <div className="cr-root">
-        <div className="cr-grid" aria-hidden/>
-        <div className="cr-amb1" aria-hidden/>
-        <div className="cr-amb2" aria-hidden/>
+        <div className="cr-grid" aria-hidden />
+        <div className="cr-amb1" aria-hidden />
+        <div className="cr-amb2" aria-hidden />
 
-        {isLearningMode && <LearningOverlay/>}
-        {!isLearningMode && anyAnalyzing && <AnalyzingOverlay speakerName={speakerDisplayName}/>}
+        {isLearningMode && <LearningOverlay />}
+        {!isLearningMode && anyAnalyzing && (
+          <AnalyzingOverlay speakerName={speakerDisplayName} />
+        )}
         {showExitConfirm && !anyAnalyzing && !isLearningMode && (
           <ExitModal
-            onConfirm={()=>{setShowExitConfirm(false);onExit?.();}}
-            onCancel={()=>setShowExitConfirm(false)}
+            onConfirm={() => { setShowExitConfirm(false); onExit?.(); }}
+            onCancel={() => setShowExitConfirm(false)}
           />
         )}
 
@@ -930,27 +1321,55 @@ export default function ChallengeRoom({
         <header className="cr-hdr">
           <div className="cr-logo">
             <div className="cr-logo-mark">B2</div>
-            <div><span className="cr-logo-t">Beruf</span><span className="cr-logo-s">Sprachtraining</span></div>
+            <div>
+              <span className="cr-logo-t">Beruf</span>
+              <span className="cr-logo-s">Sprachtraining</span>
+            </div>
           </div>
           <div className="cr-hdr-c">
-            {status!=="intro"&&(
+            {status !== "intro" && (
+              // FIX 3: Round-Progress dots are derived directly from roundResults state.
+              // They update reactively for BOTH users whenever Firebase pushes new results.
               <div className="cr-prog">
-                {[1,2].map(r=>(
-                  <div key={r} className={`cr-pseg${rs.round>=r?" cr-pa":""}${roundResults[`round${r}`]?" cr-pd":""}`}>{r}</div>
+                {[1, 2].map((r) => (
+                  <div
+                    key={r}
+                    className={`cr-pseg${rs.round >= r ? " cr-pa" : ""}${
+                      roundResults[`round${r}`] ? " cr-pd" : ""
+                    }`}
+                  >
+                    {r}
+                  </div>
                 ))}
               </div>
             )}
           </div>
           <div className="cr-hdr-r">
-            {isMulti&&<div className="cr-partner-chip"><span className="cr-pdot"/>{partnerName}</div>}
-            {isRecording&&amSpeaker&&<div className="cr-rec-chip"><span className="cr-rdot"/>REC</div>}
+            {isMulti && (
+              <div className="cr-partner-chip">
+                <span className="cr-pdot" />
+                {partnerName}
+              </div>
+            )}
+            {isRecording && amSpeaker && (
+              <div className="cr-rec-chip">
+                <span className="cr-rdot" />
+                REC
+              </div>
+            )}
             <button
-              className={`cr-x${(anyAnalyzing||isLearningMode)?" cr-x-locked":""}`}
+              className={`cr-x${anyAnalyzing || isLearningMode ? " cr-x-locked" : ""}`}
               onClick={handleExitRequest}
-              disabled={anyAnalyzing||isLearningMode}
-              aria-label="Beenden">
+              disabled={anyAnalyzing || isLearningMode}
+              aria-label="Beenden"
+            >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none">
-                <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
+                <path
+                  d="M18 6L6 18M6 6l12 12"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                />
               </svg>
             </button>
           </div>
@@ -959,82 +1378,119 @@ export default function ChallengeRoom({
         <main className={`cr-main cr-a-${phaseAnim}`}>
 
           {/* INTRO */}
-          {status==="intro"&&(
+          {status === "intro" && (
             <div className="intro-wrap">
               <div className="intro-img-side">
-                <img src={heroBgImage} alt="" className="intro-img"/>
-                <div className="intro-img-ov"/>
+                <img src={heroBgImage} alt="" className="intro-img" />
+                <div className="intro-img-ov" />
               </div>
               <div className="intro-content">
-                <div className="intro-ey"><span className="intro-ey-dot"/>Deutschprüfung · B2 · Mündlich</div>
-                <h1 className="intro-h">Meistere das<br/><span className="intro-acc">Sprechen</span></h1>
+                <div className="intro-ey">
+                  <span className="intro-ey-dot" />
+                  Deutschprüfung · B2 · Mündlich
+                </div>
+                <h1 className="intro-h">
+                  Meistere das
+                  <br />
+                  <span className="intro-acc">Sprechen</span>
+                </h1>
                 <p className="intro-d">
-                  {isSolo?"Solo-Modus · 30 s Vorbereitung · 3 min Sprechen · KI-Feedback"
-                    :`Duell mit ${partnerName} · 2 Runden · Live-Transkript · KI-Feedback`}
+                  {isSolo
+                    ? "Solo-Modus · 30 s Vorbereitung · 3 min Sprechen · KI-Feedback"
+                    : `Duell mit ${partnerName} · 2 Runden · Live-Transkript · KI-Feedback`}
                 </p>
                 <div className="intro-meta">
-                  {[["⏱","30 s Prep"],["🎙","3 min"],["🤖","KI-Score"],["📖","Musterlösung"]].map(([ic,lb])=>(
-                    <div key={lb} className="intro-meta-item"><span>{ic}</span><span>{lb}</span></div>
+                  {[
+                    ["⏱", "30 s Prep"],
+                    ["🎙", "3 min"],
+                    ["🤖", "KI-Score"],
+                    ["📖", "Musterlösung"],
+                  ].map(([ic, lb]) => (
+                    <div key={lb} className="intro-meta-item">
+                      <span>{ic}</span>
+                      <span>{lb}</span>
+                    </div>
                   ))}
                 </div>
-                {(!isMulti||fbReady)
-                  ? <button className="btn-p" onClick={()=>beginPrep(me.uid,1)}>
-                      Jetzt starten
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-                        <path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
-                      </svg>
-                    </button>
-                  : <p className="intro-conn">Verbinde mit Raum…</p>
-                }
+                {!isMulti || fbReady ? (
+                  <button className="btn-p" onClick={() => beginPrep(me.uid, 1)}>
+                    Jetzt starten
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                      <path
+                        d="M5 12h14M13 6l6 6-6 6"
+                        stroke="currentColor"
+                        strokeWidth="2.5"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
+                ) : (
+                  <p className="intro-conn">Verbinde mit Raum…</p>
+                )}
               </div>
             </div>
           )}
 
           {/* PREP */}
-          {status==="prep"&&currentQ&&(
+          {status === "prep" && currentQ && (
             <div className="game-lay">
               <div className="game-l">
-                <CircularTimer timeLeft={timeLeft} totalTime={PREP_SEC} phase="prep"/>
+                <CircularTimer timeLeft={timeLeft} totalTime={PREP_SEC} phase="prep" />
                 <div className="ph-badge ph-prep">Vorbereitung</div>
-                {amSpeaker&&<button className="btn-skip" onClick={handleSkipPrep}>Jetzt sprechen →</button>}
-                {isMulti&&<div className={`role-chip${amSpeaker?" role-spk":" role-lst"}`}>
-                  {amSpeaker?"🎙 Sprecher":"👂 Zuhörer"}
-                </div>}
+                {amSpeaker && (
+                  <button className="btn-skip" onClick={handleSkipPrep}>
+                    Jetzt sprechen →
+                  </button>
+                )}
+                {isMulti && (
+                  <div className={`role-chip${amSpeaker ? " role-spk" : " role-lst"}`}>
+                    {amSpeaker ? "🎙 Sprecher" : "👂 Zuhörer"}
+                  </div>
+                )}
               </div>
               <div className="game-r">
                 <div className="q-card">
                   <div className="q-num">Aufgabe · Runde {rs.round}</div>
-                  {currentQ.topic&&<div className="q-topic">{currentQ.topic}</div>}
+                  {currentQ.topic && <div className="q-topic">{currentQ.topic}</div>}
                   <p className="q-text">{currentQ.question}</p>
                 </div>
-                {currentQ.redemittel?.length>0&&<RedemittelPanel items={currentQ.redemittel}/>}
+                {currentQ.redemittel?.length > 0 && (
+                  <RedemittelPanel items={currentQ.redemittel} />
+                )}
               </div>
             </div>
           )}
 
           {/* SPEAKING */}
-          {status==="speaking"&&currentQ&&(
+          {status === "speaking" && currentQ && (
             <div className="game-lay">
               <div className="game-l">
-                <CircularTimer timeLeft={timeLeft} totalTime={SPEAK_SEC} phase="speak"/>
+                <CircularTimer timeLeft={timeLeft} totalTime={SPEAK_SEC} phase="speak" />
                 <div className="ph-badge ph-spk">Sprechen</div>
-                {amSpeaker&&(
-                  <button className={`btn-mic${isRecording?" btn-mic-on":""}`}
-                    onClick={()=>setIsRecording(r=>!r)}>
-                    {isRecording?<><MicOnIcon/>Aktiv</>:<><MicOffIcon/>Stumm</>}
+                {amSpeaker && (
+                  <button
+                    className={`btn-mic${isRecording ? " btn-mic-on" : ""}`}
+                    onClick={() => setIsRecording((r) => !r)}
+                  >
+                    {isRecording ? (
+                      <><MicOnIcon />Aktiv</>
+                    ) : (
+                      <><MicOffIcon />Stumm</>
+                    )}
                   </button>
                 )}
-                {!amSpeaker&&isMulti&&(
+                {!amSpeaker && isMulti && (
                   <div className="waiting-banner">
-                    <span className="wait-dot"/>
+                    <span className="wait-dot" />
                     <span>{speakerDisplayName} spricht…</span>
                     <span className="wait-lock">🔒 Mikrofon gesperrt</span>
                   </div>
                 )}
-                {amSpeaker&&(
+                {amSpeaker && (
                   <button className="btn-danger" onClick={handleSpeakEnd}>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                      <rect x="4" y="4" width="16" height="16" rx="2"/>
+                      <rect x="4" y="4" width="16" height="16" rx="2" />
                     </svg>
                     Runde beenden
                   </button>
@@ -1042,10 +1498,12 @@ export default function ChallengeRoom({
               </div>
               <div className="game-r">
                 <div className="q-card q-card-sm">
-                  {currentQ.topic&&<div className="q-topic">{currentQ.topic}</div>}
+                  {currentQ.topic && <div className="q-topic">{currentQ.topic}</div>}
                   <p className="q-text">{currentQ.question}</p>
                 </div>
-                {currentQ.redemittel?.length>0&&<RedemittelPanel items={currentQ.redemittel}/>}
+                {currentQ.redemittel?.length > 0 && (
+                  <RedemittelPanel items={currentQ.redemittel} />
+                )}
                 <LiveTranscriptPanel
                   speakerName={speakerDisplayName}
                   text={speakerTx.text}
@@ -1057,14 +1515,15 @@ export default function ChallengeRoom({
           )}
 
           {/* ANALYZING */}
-          {status==="analyzing"&&(
+          {status === "analyzing" && (
             <div className="center-stage">
               <div className="center-card">
-                <svg width="52" height="52" viewBox="0 0 52 52" style={{marginBottom:12}}>
-                  <circle cx="26" cy="26" r="22" fill="none" stroke="rgba(34,211,238,.1)" strokeWidth="4"/>
+                <svg width="52" height="52" viewBox="0 0 52 52" style={{ marginBottom: 12 }}>
+                  <circle cx="26" cy="26" r="22" fill="none" stroke="rgba(34,211,238,.1)" strokeWidth="4" />
                   <circle cx="26" cy="26" r="22" fill="none" stroke="#22d3ee" strokeWidth="4"
                     strokeLinecap="round" strokeDasharray="42 96"
-                    style={{animation:"cr-spin 1.1s linear infinite",transformOrigin:"center"}}/>
+                    style={{ animation: "cr-spin 1.1s linear infinite", transformOrigin: "center" }}
+                  />
                 </svg>
                 <h2 className="cc-title">Analysiere…</h2>
                 <p className="cc-sub">KI wertet Runde {rs.round} aus</p>
@@ -1073,17 +1532,20 @@ export default function ChallengeRoom({
           )}
 
           {/* RESULTS */}
-          {status==="results"&&(
+          {status === "results" && (
             <div className="res-lay">
               <div className="res-hdr">
                 <h2 className="res-title">
-                  {currentRoundResult?.isLearningMode
+                  {currentRoundResult?.isModelAnswer
+                    ? "📖 Musterlösung · Runde " + rs.round
+                    : currentRoundResult?.isLearningMode
                     ? "📖 Lernmodus · Runde " + rs.round
                     : "Ergebnis · Runde " + rs.round}
                 </h2>
-                {isMulti&&(
+                {isMulti && (
                   <div className="res-sync">
-                    <span className="res-sync-dot"/>Beide Nutzer sehen dies gleichzeitig
+                    <span className="res-sync-dot" />
+                    Beide Nutzer sehen dies gleichzeitig
                   </div>
                 )}
               </div>
@@ -1091,48 +1553,68 @@ export default function ChallengeRoom({
                 result={currentRoundResult}
                 speakerName={speakerDisplayName}
                 roundNum={rs.round}
-                isLoading={!currentRoundResult&&isSpeakerAnalyzing}
+                isLoading={!currentRoundResult && isSpeakerAnalyzing}
               />
               <div className="res-actions">
-                {rs.round===1&&(
-                  amSpeaker||isSolo
-                    ? <button className="btn-p" onClick={handleNextRound}>Nächste Runde →</button>
-                    : <p className="wait-txt"><span className="wait-dot"/>Warte auf {speakerDisplayName}…</p>
-                )}
-                {rs.round>=2&&(
-                  amSpeaker||isSolo
-                    ? <button className="btn-p" onClick={handleFinish}>Abschlussergebnis →</button>
-                    : <p className="wait-txt"><span className="wait-dot"/>Warte auf {speakerDisplayName}…</p>
-                )}
+                {rs.round === 1 &&
+                  (amSpeaker || isSolo ? (
+                    <button className="btn-p" onClick={handleNextRound}>
+                      Nächste Runde →
+                    </button>
+                  ) : (
+                    <p className="wait-txt">
+                      <span className="wait-dot" />
+                      Warte auf {speakerDisplayName}…
+                    </p>
+                  ))}
+                {rs.round >= 2 &&
+                  (amSpeaker || isSolo ? (
+                    <button className="btn-p" onClick={handleFinish}>
+                      Abschlussergebnis →
+                    </button>
+                  ) : (
+                    <p className="wait-txt">
+                      <span className="wait-dot" />
+                      Warte auf {speakerDisplayName}…
+                    </p>
+                  ))}
               </div>
             </div>
           )}
 
           {/* SWITCHING */}
-          {status==="switching"&&(
+          {status === "switching" && (
             <div className="center-stage">
               <div className="sw-card">
                 <div className="sw-icon">
                   <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
-                    <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"
-                      stroke="#22d3ee" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+                    <path
+                      d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"
+                      stroke="#22d3ee" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
+                    />
                   </svg>
                 </div>
                 <h2 className="sw-title">Rollenwechsel</h2>
                 <p className="sw-sub">
                   Runde {rs.round} beginnt. Sprecher:&nbsp;
-                  <strong className="sw-name">{amSpeaker?"Du":partnerName}</strong>
+                  <strong className="sw-name">{amSpeaker ? "Du" : partnerName}</strong>
                 </p>
-                {amSpeaker
-                  ? <button className="btn-p" onClick={handleStartMyRound}>Runde {rs.round} starten →</button>
-                  : <p className="wait-txt"><span className="wait-dot"/>Warte auf {partnerName}…</p>
-                }
+                {amSpeaker ? (
+                  <button className="btn-p" onClick={handleStartMyRound}>
+                    Runde {rs.round} starten →
+                  </button>
+                ) : (
+                  <p className="wait-txt">
+                    <span className="wait-dot" />
+                    Warte auf {partnerName}…
+                  </p>
+                )}
               </div>
             </div>
           )}
 
           {/* FINISHED */}
-          {status==="finished"&&(
+          {status === "finished" && (
             <div className="fin-lay">
               <div className="fin-hero">
                 <div className="fin-trophy">🏆</div>
@@ -1140,37 +1622,71 @@ export default function ChallengeRoom({
                 <p className="fin-sub">Hervorragende Arbeit!</p>
               </div>
               <div className="fin-scores">
-                {[round1Result,round2Result].map((r,i)=> r && !r.isLearningMode && (
-                  <div key={i} className="ssc">
-                    <div className="ssc-rnd">Runde {i+1}</div>
-                    <div className="ssc-s">{r.score}<span>/5</span></div>
-                    <div className="ssc-bars">
-                      {[1,2,3,4,5].map(b=>(
-                        <div key={b} className={`ssc-b${b<=r.score?" ssc-b-on":""}`} style={{"--bh":`${b*5+4}px`}}/>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-                {[round1Result,round2Result].map((r,i)=> r?.isLearningMode && (
-                  <div key={i} className="ssc ssc-learn">
-                    <div className="ssc-rnd">Runde {i+1}</div>
-                    <div className="ssc-learn-icon">📖</div>
-                    <div className="ssc-learn-lbl">Lernmodus</div>
-                  </div>
-                ))}
+                {[round1Result, round2Result].map(
+                  (r, i) =>
+                    r &&
+                    !r.isLearningMode &&
+                    !r.isModelAnswer && (
+                      <div key={i} className="ssc">
+                        <div className="ssc-rnd">Runde {i + 1}</div>
+                        <div className="ssc-s">
+                          {r.score}
+                          <span>/5</span>
+                        </div>
+                        <div className="ssc-bars">
+                          {[1, 2, 3, 4, 5].map((b) => (
+                            <div
+                              key={b}
+                              className={`ssc-b${b <= r.score ? " ssc-b-on" : ""}`}
+                              style={{ "--bh": `${b * 5 + 4}px` }}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    )
+                )}
+                {[round1Result, round2Result].map(
+                  (r, i) =>
+                    r?.isModelAnswer && (
+                      <div key={i} className="ssc ssc-learn">
+                        <div className="ssc-rnd">Runde {i + 1}</div>
+                        <div className="ssc-learn-icon">📖</div>
+                        <div className="ssc-learn-lbl">Musterlösung</div>
+                      </div>
+                    )
+                )}
+                {[round1Result, round2Result].map(
+                  (r, i) =>
+                    r?.isLearningMode && !r?.isModelAnswer && (
+                      <div key={i} className="ssc ssc-learn">
+                        <div className="ssc-rnd">Runde {i + 1}</div>
+                        <div className="ssc-learn-icon">📖</div>
+                        <div className="ssc-learn-lbl">Lernmodus</div>
+                      </div>
+                    )
+                )}
               </div>
               <div className="fin-results">
-                {[round1Result,round2Result].map((r,i)=> r && (
-                  <ResultsView
-                    key={i}
-                    result={r}
-                    roundNum={i+1}
-                    speakerName={rs.speakerOrder?.[i]===me.uid?me.displayName:partnerName}
-                    isLoading={false}
-                  />
-                ))}
+                {[round1Result, round2Result].map(
+                  (r, i) =>
+                    r && (
+                      <ResultsView
+                        key={i}
+                        result={r}
+                        roundNum={i + 1}
+                        speakerName={
+                          rs.speakerOrder?.[i] === me.uid
+                            ? me.displayName
+                            : partnerName
+                        }
+                        isLoading={false}
+                      />
+                    )
+                )}
               </div>
-              <button className="btn-p" style={{marginTop:8}} onClick={()=>onExit?.()}>Beenden</button>
+              <button className="btn-p" style={{ marginTop: 8 }} onClick={() => onExit?.()}>
+                Beenden
+              </button>
             </div>
           )}
 
@@ -1181,7 +1697,7 @@ export default function ChallengeRoom({
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CSS
+// CSS (unchanged from v9)
 // ─────────────────────────────────────────────────────────────────────────────
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap');
@@ -1368,9 +1884,9 @@ const CSS = `
 .rc-err-arr{color:var(--dm);}
 .rc-err-exp{font-size:11px;color:var(--mu);font-style:italic;}
 .rc-feedback{font-family:var(--fb);font-size:13.5px;line-height:1.78;color:rgba(255,255,255,.58);}
-/* ── Musterlösung ── */
 .mc-wrap{display:flex;flex-direction:column;gap:14px;animation:cr-slide .35s ease both;}
 .mc-notice{display:flex;align-items:flex-start;gap:14px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.22);border-radius:var(--rs);padding:16px 18px;}
+.mc-notice-model{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.35);}
 .mc-notice-icon{font-size:22px;flex-shrink:0;margin-top:2px;}
 .mc-notice-title{font-family:var(--fd);font-size:13.5px;font-weight:700;color:var(--am);margin-bottom:3px;}
 .mc-notice-sub{font-size:12.5px;color:var(--mu);line-height:1.55;}
@@ -1381,19 +1897,16 @@ const CSS = `
 .mc-tip{display:flex;align-items:flex-start;gap:10px;background:var(--cy2);border:1px solid var(--b3);border-radius:var(--rs);padding:12px 15px;margin-top:6px;}
 .mc-tip-icon{font-size:15px;flex-shrink:0;}
 .mc-tip p{font-size:12px;color:var(--cy);line-height:1.55;}
-/* ── Muster reference collapsible ── */
 .muster-ref-details{border:1px solid var(--b);border-radius:var(--rs);overflow:hidden;}
 .muster-ref-summary{display:flex;align-items:center;gap:8px;padding:12px 16px;font-family:var(--fd);font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:var(--mu);cursor:pointer;list-style:none;transition:color .2s;user-select:none;}
 .muster-ref-summary::-webkit-details-marker{display:none;}
 .muster-ref-summary:hover{color:var(--am);}
 .muster-ref-details[open] .muster-ref-summary{color:var(--am);border-bottom:1px solid var(--b);}
-/* ── Switch card ── */
 .sw-card{background:var(--sf);border:1px solid var(--b2);border-radius:var(--r);padding:48px 40px;text-align:center;max-width:390px;width:100%;display:flex;flex-direction:column;align-items:center;gap:14px;box-shadow:0 28px 56px rgba(0,0,0,.5);}
 .sw-icon{width:58px;height:58px;border-radius:50%;background:var(--cy2);border:1px solid var(--b3);display:flex;align-items:center;justify-content:center;}
 .sw-title{font-family:var(--fd);font-size:24px;font-weight:800;color:#fff;}
 .sw-sub{font-size:13px;color:var(--mu);line-height:1.6;}
 .sw-name{color:var(--cy);font-weight:600;}
-/* ── Finished ── */
 .fin-lay{max-width:780px;margin:0 auto;padding:44px 28px;display:flex;flex-direction:column;align-items:center;gap:28px;}
 .fin-hero{text-align:center;}
 .fin-trophy{font-size:56px;margin-bottom:10px;}
