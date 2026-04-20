@@ -1117,165 +1117,16 @@ export default function ChallengeRoom({
     anim();
   }
 
-  async function handleSkipPrep() {
-    if (!amSpeaker) return;
-    clearInterval(masterTimerRef.current);
-    masterEndsAtRef.current = null;
-    await _doBeginSpeaking();
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // handleSpeakEnd — FIX 3 + FIX 4
-  //
-  // FIX 3: aiResult is written to Firebase BEFORE status → "results",
-  //   so the Firebase results listener populates both clients atomically.
-  //
-  // FIX 4: empty transcript → skip AI call entirely, write isModelAnswer payload.
-  // ─────────────────────────────────────────────────────────────────────────
-  async function handleSpeakEnd() {
-    if (isMulti && rsRef.current.currentSpeaker !== me.uid) return;
-    clearInterval(masterTimerRef.current);
-    masterEndsAtRef.current = null;
-    setIsRecording(false);
-    stopRecog();
-    playBeep({ freq: 440, gain: 0.3 });
-
-    const finalText      = transcriptRef.current;
-    const curRound       = rsRef.current.round;
-    const curRKey        = `round${curRound}`;
-    const q              = currentQRef.current;
-    const questionText   = q?.question || "";
-    const topicText      = q?.topic    || "";
-    const spokeSomething = hasContent(finalText);
-
-    const flagPath = isMulti && roomId ? `rooms/${roomId}/analyzing/${me.uid}` : null;
-
-    // Set analyzing flag + status simultaneously
-    await Promise.all([
-      flagPath
-        ? fbSet(flagPath, true)
-        : Promise.resolve(setAnalyzingMap((p) => ({ ...p, [me.uid]: true }))),
-      pushRS({ status: "analyzing", timerEndsAt: null }),
-    ]);
-    anim();
-
-    try {
-      if (spokeSomething) {
-        // ══ NORMAL PATH ══════════════════════════════════════════════════════
-        // FIX 3: evaluate AND fetch muster reference in parallel,
-        //   then write result to Firebase FIRST, then flip status.
-        setIsLearningMode(false);
-
-        const [aiResult, muster] = await Promise.all([
-          fetchAI(finalText, questionText),
-          fetchModelAnswer(questionText, topicText),
-        ]);
-
-        const payload = {
-          ...(aiResult || {
-            score: 2,
-            isOffTopic: false,
-            correctedText: "",
-            feedback: "Keine Auswertung verfügbar.",
-            errors: [],
-          }),
-          transcript:     finalText,
-          speakerUid:     me.uid,
-          isModelAnswer:  false,
-          isLearningMode: false,
-          muster:         muster,  // collapsible reference
-          savedAt:        Date.now(),
-        };
-
-        // FIX 3: write results before setting status so both clients
-        //   get the data from the results listener before rendering
-        if (isMulti && roomId) {
-          await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
-        } else {
-          setRoundResults((p) => ({ ...p, [curRKey]: payload }));
-        }
-        await pushRS({ status: "results" });
-        anim();
-
-      } else {
-        // ══ FIX 4: MODEL ANSWER PATH ═════════════════════════════════════════
-        // User was silent → do NOT call AI evaluator (save credits).
-        // Fetch Musterlösung and write with isModelAnswer: true flag.
-        setIsLearningMode(true);
-
-        const muster = await fetchModelAnswer(questionText, topicText);
-
-        const payload = {
-          score:          0,
-          isOffTopic:     false,
-          isModelAnswer:  true,   // FIX 4: distinguishing flag
-          isLearningMode: true,   // kept for backward compat
-          transcript:     "",
-          speakerUid:     me.uid,
-          muster:         muster,
-          correctedText:  "",
-          feedback:
-            "Du hast keine Antwort gegeben. Hier ist die ideale Antwort — übe damit!",
-          errors:         [],
-          savedAt:        Date.now(),
-        };
-
-        // FIX 3: write to Firebase before flipping status
-        if (isMulti && roomId) {
-          await fbSet(`rooms/${roomId}/results/${curRKey}`, payload);
-        } else {
-          setRoundResults((p) => ({ ...p, [curRKey]: payload }));
-        }
-
-        setIsLearningMode(false);
-        await pushRS({ status: "results" });
-        anim();
-      }
-    } catch (err) {
-      console.error("Round-end error:", err);
-      setIsLearningMode(false);
-      await pushRS({ status: "results" });
-      anim();
-    } finally {
-      if (flagPath) await fbSet(flagPath, false);
-      else setAnalyzingMap((p) => ({ ...p, [me.uid]: false }));
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // ─────────────────────────────────────────────────────────────────────────
-  // handleNextRound — Explicit A/B Toggle
-  //
-  // Step 1  Read players from playersRef (synced by useEffect on every Firebase
-  //         push). Fall back to a live Firebase get() if either slot is missing.
-  //
-  // Step 2  Read currentSpeaker from rsRef.current — this ref is kept in sync
-  //         by its own useEffect and always holds the latest committed value
-  //         even if the React render cycle has not completed yet.
-  //
-  // Step 3  Explicit toggle:
-  //           currentSpeaker === players.A.uid  →  nextSpeaker = players.B.uid
-  //           otherwise                         →  nextSpeaker = players.A.uid
-  //
-  // Step 4  Write all four fields to Firebase in a single fbUpdate call so
-  //         both clients receive the complete new state atomically.
-  // ─────────────────────────────────────────────────────────────────────────
-  async function handleNextRound() {
+async function handleNextRound() {
     if (!amSpeaker) return;
 
-    // rsRef is always current (kept in sync by useEffect) — reading it here
-    // gives us the latest committed values without waiting for re-render.
     const currentSpeaker = rsRef.current.currentSpeaker;
     const nextRound      = rsRef.current.round + 1;
     let nextSpeaker;
 
     if (isMulti && roomId) {
-      // ── Step 1: resolve the authoritative players object ──────────────────
-      // Primary: playersRef is mirrored from the Firebase listener (fast, no I/O).
+      // ── Resolve authoritative players object ──────────────────────────────
       let pl = playersRef.current || {};
-
-      // Safety net: if either A or B slot is missing, do a one-shot Firebase
-      // read to get ground truth and repopulate the ref for future calls.
       if (!pl.A?.uid || !pl.B?.uid) {
         try {
           const db = await getDB();
@@ -1284,7 +1135,7 @@ export default function ChallengeRoom({
             const snap = await get(fbRef(db, `rooms/${roomId}/players`));
             if (snap.exists()) {
               pl = snap.val();
-              playersRef.current = pl; // keep ref warm for subsequent calls
+              playersRef.current = pl;
             }
           }
         } catch (e) {
@@ -1294,36 +1145,59 @@ export default function ChallengeRoom({
 
       const uidA = pl.A?.uid;
       const uidB = pl.B?.uid;
+      nextSpeaker = (uidA && uidB)
+        ? (currentSpeaker === uidA ? uidB : uidA)
+        : (partnerUidRef.current || me.uid);
 
-      if (uidA && uidB) {
-        // ── Step 3: explicit A/B toggle ──────────────────────────────────────
-        nextSpeaker = currentSpeaker === uidA ? uidB : uidA;
-      } else {
-        // Last-resort: use partnerUidRef if only one slot resolved
-        console.warn("handleNextRound: A/B UIDs incomplete, falling back to partnerUidRef");
-        nextSpeaker = partnerUidRef.current || me.uid;
-      }
+      // ── Reset transcripts for both players ───────────────────────────────
+      await Promise.all([
+        fbSet(`rooms/${roomId}/transcript/${me.uid}`,
+          { text: "", interim: "", updatedAt: Date.now() }),
+        partnerUidRef.current
+          ? fbSet(`rooms/${roomId}/transcript/${partnerUidRef.current}`,
+              { text: "", interim: "", updatedAt: Date.now() })
+          : Promise.resolve(),
+      ]);
 
-      // ── Step 4: single atomic RTDB PATCH ─────────────────────────────────
-      // Use fbUpdate directly (not the pushRS wrapper) to guarantee all four
-      // fields land in one operation — no partial-state window between clients.
+      // ── Pick the next question ────────────────────────────────────────────
+      const q = pickRandom(propQ, []);
+      if (!q) { console.warn("No questions"); return; }
+
+      const endsAt = Date.now() + PREP_SEC * 1000;
+
+      // ── Single atomic write: swap speaker + start prep immediately ────────
       await fbUpdate(`rooms/${roomId}/roomState`, {
-        currentSpeaker: nextSpeaker,
-        round:          nextRound,
-        status:         "switching",
-        timerEndsAt:    null,
+        currentSpeaker:    nextSpeaker,
+        round:             nextRound,
+        status:            "prep",
+        timerPhase:        "prep",
+        timerEndsAt:       endsAt,
+        currentQuestionId: q.id,
       });
 
     } else {
-      // Solo mode: speaker never changes, just advance the round locally.
+      // Solo mode: speaker stays as me, advance round + restart prep
       nextSpeaker = me.uid;
+      const q = pickRandom(propQ, soloUsedIds);
+      if (!q) { console.warn("No questions"); return; }
+      setSoloUsedIds((p) => [...p, q.id]);
+
+      transcriptRef.current = "";
+      setTranscripts({});
+      setIsLearningMode(false);
+
+      const endsAt = Date.now() + PREP_SEC * 1000;
       setRs((prev) => ({
         ...prev,
-        currentSpeaker: nextSpeaker,
-        round:          nextRound,
-        status:         "switching",
-        timerEndsAt:    null,
+        currentSpeaker:    nextSpeaker,
+        round:             nextRound,
+        status:            "prep",
+        timerPhase:        "prep",
+        timerEndsAt:       endsAt,
+        currentQuestionId: q.id,
       }));
+      masterEndsAtRef.current = endsAt;
+      _startCountdown(endsAt, "prep", q.id);
     }
 
     anim();
@@ -1606,16 +1480,16 @@ export default function ChallengeRoom({
               />
               <div className="res-actions">
                 {rs.round === 1 &&
-                  (amSpeaker || isSolo ? (
-                    <button className="btn-p" onClick={handleNextRound}>
-                      Nächste Runde →
-                    </button>
-                  ) : (
-                    <p className="wait-txt">
-                      <span className="wait-dot" />
-                      Warte auf {speakerDisplayName}…
-                    </p>
-                  ))}
+  (amSpeaker ? (
+    <button className="btn-p" onClick={handleNextRound}>
+      Nächste Runde →
+    </button>
+  ) : (
+    <p className="wait-txt">
+      <span className="wait-dot" />
+      Warte auf {speakerDisplayName}…
+    </p>
+  ))}
                 {rs.round >= 2 &&
                   (amSpeaker || isSolo ? (
                     <button className="btn-p" onClick={handleFinish}>
@@ -1632,35 +1506,7 @@ export default function ChallengeRoom({
           )}
 
           {/* SWITCHING */}
-          {status === "switching" && (
-            <div className="center-stage">
-              <div className="sw-card">
-                <div className="sw-icon">
-                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
-                    <path
-                      d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"
-                      stroke="#22d3ee" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"
-                    />
-                  </svg>
-                </div>
-                <h2 className="sw-title">Rollenwechsel</h2>
-                <p className="sw-sub">
-                  Runde {rs.round} beginnt. Sprecher:&nbsp;
-                  <strong className="sw-name">{amSpeaker ? "Du" : partnerName}</strong>
-                </p>
-                {amSpeaker ? (
-                  <button className="btn-p" onClick={handleStartMyRound}>
-                    Runde {rs.round} starten →
-                  </button>
-                ) : (
-                  <p className="wait-txt">
-                    <span className="wait-dot" />
-                    Warte auf {partnerName}…
-                  </p>
-                )}
-              </div>
-            </div>
-          )}
+      
 
           {/* FINISHED */}
           {status === "finished" && (
